@@ -1,8 +1,12 @@
 #include "sfm/map/ModelStore.h"
+#include "sfm/map/RegionalPrefetch.h"
 
 #include <algorithm>
+#include <chrono>
+#include <condition_variable>
 #include <cstdio>
 #include <fstream>
+#include <mutex>
 #include <set>
 #include <thread>
 
@@ -68,6 +72,17 @@ static void testRoundtrip() {
     check(loaded.rigs.size() == 3 && loaded.rig_detached == m.rig_detached, "rig state lost");
     check(loaded.next_point3D_id == m.next_point3D_id, "next point id changed");
     check(modelResidentBytes(loaded) <= meta.resident_bytes, "reload exceeds saved memory estimate");
+    const auto views = model_store_detail::readModel(store.path(meta), false);
+    check(views.points3D.empty() && views.images.size() == loaded.images.size(), "camera scan loaded geometry or lost images");
+    for (const auto& kv : loaded.images) {
+        const auto& view = views.images.at(kv.first);
+        check(view.id == kv.second.id && view.camera_id == kv.second.camera_id && view.name == kv.second.name &&
+            view.registered == kv.second.registered && view.exif_orientation == kv.second.exif_orientation &&
+            view.pose.R == kv.second.pose.R && (view.pose.t - kv.second.pose.t).norm() == 0 &&
+            view.points2D.empty() && view.point3D_ids.empty(), "camera-only scan changed metadata or retained feature arrays");
+    }
+    check(views.cameras.at(101).pixel_scale == loaded.cameras.at(101).pixel_scale &&
+        views.cameras.at(101).fx == loaded.cameras.at(101).fx, "camera-only scan changed calibration");
     const auto again = store.put(loaded);
     check(bytes(store.path(meta)) == bytes(store.path(again)), "model fields changed during disk roundtrip");
     bool rejected = false;
@@ -100,6 +115,97 @@ static void testGroups() {
     try { storedModelGroups(models, 69); } catch (const std::runtime_error&) { rejected = true; }
     check(rejected, "oversized atom did not fail");
     check(storedModelGroups({}, 0).empty(), "empty grouping failed");
+}
+
+static void testBufferedRecords() {
+    ModelStore store("");
+    const auto path = store.directory() / "records.bin";
+    std::vector<uint64_t> large(400000);
+    for (size_t i = 0; i < large.size(); ++i) large[i] = uint64_t(i) * 987654321;
+    const std::string text((1u << 20) + 37, 'x');
+    {
+        model_store_detail::Writer out(path);
+        out.scalar<uint32_t>(17); out.vector(std::vector<uint32_t>{1, 2, 3});
+        out.string(text); out.vector(large); out.scalar<uint64_t>(29); out.finish();
+    }
+    {
+        model_store_detail::Reader in(path);
+        check(in.scalar<uint32_t>() == 17 && in.skipVector<uint32_t>() == 3, "buffered skip changed record position");
+        check(in.string() == text && in.vector<uint64_t>() == large && in.scalar<uint64_t>() == 29,
+              "buffer boundary changed spilled records");
+        in.finish();
+        const auto moved = store.directory() / "finished-records.bin";
+        std::filesystem::rename(path, moved);
+        std::filesystem::copy_file(moved, path);
+        check(std::filesystem::remove(moved), "finished reader kept checkpoint locked during cleanup");
+    }
+    {
+        model_store_detail::Reader in(path);
+        in.scalar<uint32_t>(); in.skipVector<uint32_t>(); in.string();
+        check(in.skipVector<uint64_t>() == large.size() && in.scalar<uint64_t>() == 29,
+              "large buffered seek changed next record");
+        in.finish();
+    }
+    std::filesystem::resize_file(path, std::filesystem::file_size(path) - 1);
+    bool rejected = false;
+    try {
+        model_store_detail::Reader in(path);
+        in.scalar<uint32_t>(); in.skipVector<uint32_t>(); in.string(); in.vector<uint64_t>(); in.scalar<uint64_t>();
+    } catch (const std::runtime_error&) { rejected = true; }
+    check(rejected, "buffered reader accepted a truncated final record");
+}
+
+static void testReadAhead() {
+    const auto main_thread = std::this_thread::get_id();
+    std::atomic<int> asynchronous{0};
+    regional::ModelReadAhead reader(3, 16u << 20, [](size_t) { return 1u << 20; }, [&](size_t i) {
+        if (std::this_thread::get_id() != main_thread) ++asynchronous;
+        auto rec = fixture(); rec.next_point3D_id = i; return rec;
+    });
+    for (int pass = 0; pass < 2; ++pass) for (size_t i = 0; i < 3; ++i)
+        check(reader.get(i).next_point3D_id == i, "prefetch reordered a model or pass");
+    check(asynchronous == 4, "prefetch did not overlap reads within memory budget");
+    regional::ModelReadAhead bounded(2, 4u << 20, [](size_t) { return 1u << 20; }, [&](size_t) {
+        check(std::this_thread::get_id() == main_thread, "prefetch exceeded combined model allowance");
+        return fixture();
+    });
+    bounded.get(0); bounded.get(1);
+    regional::ModelReadAhead failed(2, 16u << 20, [](size_t) { return 1u << 20; }, [&](size_t i) {
+        if (i) throw std::runtime_error("prefetched model unavailable");
+        return fixture();
+    });
+    failed.get(0); bool rejected = false;
+    try { failed.get(1); } catch (const std::runtime_error&) { rejected = true; }
+    check(rejected, "prefetch hid a model read failure");
+
+    const size_t cpu = std::max(1u, std::thread::hardware_concurrency());
+    if (cpu > 1) {
+        constexpr size_t allowance = 14u << 20, modelBytes = 1u << 20, buffers = 2u << 20;
+        const size_t expected = std::min<size_t>(cpu - 1, (allowance - modelBytes) / (modelBytes + buffers));
+        std::mutex mutex; std::condition_variable ready;
+        size_t active = 0, peak = 0; bool release = false;
+        regional::ModelReadAhead wide(9, allowance * 2, [modelBytes](size_t) { return modelBytes; }, [&](size_t i) {
+            if (std::this_thread::get_id() != main_thread) {
+                std::unique_lock<std::mutex> lock(mutex);
+                peak = std::max(peak, ++active); ready.notify_all();
+                ready.wait(lock, [&] { return release; }); --active;
+            }
+            auto rec = fixture(); rec.next_point3D_id = i; return rec;
+        });
+        check(wide.get(0).next_point3D_id == 0, "wide prefetch changed the first model");
+        bool reached;
+        {
+            std::unique_lock<std::mutex> lock(mutex);
+            reached = ready.wait_for(lock, std::chrono::seconds(5), [&] { return active == expected; });
+            release = true; ready.notify_all();
+        }
+        check(reached, "prefetch retained an artificial three-reader ceiling");
+        for (size_t i = 1; i < 9; ++i)
+            check(wide.get(i).next_point3D_id == i, "wide prefetch reordered models");
+        check(peak == expected && peak * (modelBytes + buffers) + modelBytes <= allowance,
+              "wide prefetch exceeded CPU or combined model/buffer allowance");
+        if (cpu >= 5) check(peak > 3, "prefetch did not use available readers beyond three");
+    }
 }
 
 static void testConcurrencyAndCleanup() {
@@ -145,7 +251,7 @@ static void testConcurrencyAndCleanup() {
 
 int main() {
     try {
-        testRoundtrip(); testGroups(); testConcurrencyAndCleanup();
+        testRoundtrip(); testGroups(); testBufferedRecords(); testReadAhead(); testConcurrencyAndCleanup();
         std::puts("sfm_model_store_test: PASS");
         return 0;
     } catch (const std::exception& e) {

@@ -331,7 +331,8 @@ struct AutoResult {
 // run was stopped; other failures come back in `exit_code`.
 AutoResult run_auto(SfmConfig& cfg, const AutoInputs& in);
 std::optional<AutoResult> run_regional(SfmConfig cfg, const std::string& matches,
-    const std::string& features, const std::string& images, const std::filesystem::path& sparse);
+    const std::string& features, const std::string& images, const std::filesystem::path& sparse,
+    MatchesIndex* indexed = nullptr);
 
 // What a run was asked for: a finalized config and the inputs beside it.
 struct AutoRequest {

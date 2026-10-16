@@ -42,6 +42,7 @@
 #include <vector>
 
 #include "sfm/core/Events.h"
+#include "sfm/map/AtomScheduling.h"
 #include "sfm/core/Features.h"
 #include "sfm/core/Matches.h"
 #include "sfm/core/Model.h"
@@ -53,12 +54,10 @@
 namespace sfm {
 
 struct AtomOptions {
-    // Workers, each with its own Vulkan context. 0 = hardware_concurrency,
-    // clamped by `max_threads`: the contexts are the reason for a ceiling
-    // (each maps two 64 MB staging buffers), and past a handful of them the
-    // atoms' small solves are contending for one device anyway.
+    // Zero uses all hardware CPU slots subject to aggregate RAM/VRAM credits.
     int threads = 0;
-    int max_threads = 8;
+    int max_threads = 0;  // optional legacy user ceiling, zero has no fixed cap
+    size_t host_budget_bytes = 0, device_budget_bytes = 0, caller_owned_bytes = 0;
     // Bundle-adjustment cadence inside an atom. Far looser than the mapper's
     // global default because a forty-image solve does not fill the hardware,
     // and what it protects against is a bad registration in a model small
@@ -213,6 +212,63 @@ inline void toGlobalIds(Reconstruction& m, const std::vector<uint32_t>& to_globa
 
 using AtomModelSink = std::function<void(size_t, size_t, Reconstruction&&)>;
 
+namespace detail {
+inline uint64_t atomSharedInputBytes(const MatchesDatabase& db, const std::vector<FeatureSet>& feats,
+    const std::vector<std::vector<uint32_t>>& adj, const MapperOptions& base,
+    const std::vector<std::vector<uint32_t>>& atoms) {
+    using namespace atom_scheduling; uint64_t bytes = sizeof(db) + sizeof(feats) + sizeof(adj) + sizeof(atoms);
+    bytes = add(bytes, multiply(db.images.capacity(), sizeof(ImageEntry)));
+    bytes = add(bytes, multiply(db.pairs.capacity(), sizeof(TwoViewMatches)));
+    bytes = add(bytes, multiply(feats.capacity(), sizeof(FeatureSet)));
+    bytes = add(bytes, multiply(adj.capacity() + atoms.capacity(), sizeof(std::vector<uint32_t>)));
+    uint64_t features = 0, matches = 0;
+    for (const auto& image : db.images) bytes = add(bytes, image.name.capacity() + 1);
+    for (const auto& pair : db.pairs) { matches = add(matches, pair.matches.size()); bytes = add(bytes, multiply(pair.matches.size(), sizeof(FeatureMatch))); }
+    for (const auto& f : feats) { features = add(features, f.keypoints.size()); bytes = add(bytes, multiply(f.keypoints.capacity(), sizeof(Keypoint))); bytes = add(bytes, f.colors.capacity() + f.descriptors.capacity() + f.exif_camera.capacity() + 1); }
+    for (const auto& rows : adj) bytes = add(bytes, multiply(rows.capacity(), sizeof(uint32_t)));
+    for (const auto& rows : atoms) bytes = add(bytes, multiply(rows.capacity(), sizeof(uint32_t)));
+    // The outer mapper retains its correspondence cache and feature score tables.
+    const auto graph = add(multiply(matches, 16), multiply(features + db.images.size(), 8));
+    bytes = add(bytes, base.graph_cache_bytes ? std::min<uint64_t>(graph, base.graph_cache_bytes) : graph);
+    return add(bytes, add(multiply(features, 16), multiply(db.images.size(), 512)));
+}
+inline atom_scheduling::Job forecastAtomResources(const MatchesDatabase& db, const std::vector<FeatureSet>& feats,
+    const std::vector<std::vector<uint32_t>>& adj, const std::vector<uint32_t>& atom,
+    const MapperOptions& mo, bool gpu, uint64_t auxiliaryBytes, std::vector<uint8_t>& membership) {
+    using namespace atom_scheduling; auto ids = atom; std::sort(ids.begin(), ids.end()); ids.erase(std::unique(ids.begin(), ids.end()), ids.end());
+    uint64_t features = 0, matches = 0, ownedMatches = 0, largestPair = 0, pairs = 0;
+    for (const auto id : ids) { if (id >= feats.size() || id >= db.images.size()) throw std::out_of_range("atom image resource identity"); membership.at(id) = 1; features = add(features, feats[id].keypoints.size()); }
+    for (const auto id : ids) for (uint32_t index : adj.at(id)) {
+        const auto& pair = db.pairs.at(index); if (pair.image1 != id || !membership.at(pair.image2)) continue;
+        matches = add(matches, pair.matches.size()); ownedMatches = add(ownedMatches, pair.matches.isView() ? 0 : pair.matches.size()); largestPair = std::max<uint64_t>(largestPair, pair.matches.size()); ++pairs;
+    }
+    for (const auto id : ids) membership[id] = 0;
+    // Every live point owns at least two unique image/features in a mapper model.
+    const uint64_t points = features / 2;
+    const uint64_t model = add(multiply(features, 40), add(multiply(points, sizeof(Point3D) + 80), multiply(ids.size(), sizeof(Image) + sizeof(Camera) + 256)));
+    const auto trials = std::max(1, mo.max_init_trials), further = std::max(1, mo.max_model_trials);
+    const uint64_t components = std::min<uint64_t>(std::max(1, mo.max_num_models), add(trials, further));
+    const uint64_t copies = add(std::max<uint64_t>(trials, components), 3);
+    const auto models = multiply(model, copies);
+    // CSR fill, seed memo/RANSAC, correspondence/PnP/triangulation temporaries.
+    auto nonBundle = add(models, add(multiply(features, sizeof(Keypoint) + 3 + 256), multiply(ownedMatches, 16)));
+    nonBundle = add(nonBundle, add(multiply(matches, 18), add(multiply(largestPair, 256), multiply(pairs, sizeof(TwoViewGeometry) + sizeof(TwoViewMatches) + 160))));
+    nonBundle = add(nonBundle, add(multiply(db.images.size(), sizeof(uint32_t)), multiply(auxiliaryBytes, copies + 3)));
+    bundle_detail::HostShape shape; shape.images = ids.size(); shape.points = points; shape.observations = features;
+    shape.max_track = ids.size(); shape.image_span = ids.size(); shape.max_dof = kMaxCamDof; shape.copy_bytes = model;
+    shape.pair_entries = (long double)features * (ids.size() + 1.L) / 2;
+    BundleOptions options; options.solver = mo.ba_solver; options.real = RealCfg::CPU;
+    uint64_t solver = bundle_detail::estimateHostBytes(shape, options, false);
+    options.real = realCfgFromName(mo.ba_real);
+    solver = std::max<uint64_t>(solver, bundle_detail::estimateHostBytes(shape, options, false));
+    // Native BA forecasts/allocation checks remain authoritative inside the credit.
+    solver = add(solver, std::max<uint64_t>(1u << 20, solver / 8));
+    nonBundle = add(nonBundle, std::max<uint64_t>(1u << 20, nonBundle / 8));
+    Job job; job.credit.host = add(nonBundle, solver); job.credit.device = gpu ? solver : 0;
+    job.solver_host = solver; job.solver_device = job.credit.device; job.model_bytes = models; return job;
+}
+} // namespace detail
+
 // The optional sink runs on atom workers with global image and camera ids.
 inline std::vector<Reconstruction> reconstructAtoms(
     const MatchesDatabase& db, const std::vector<FeatureSet>& feats,
@@ -226,7 +282,6 @@ inline std::vector<Reconstruction> reconstructAtoms(
 
     MapperOptions mo = base;
     mo.verbose = false;
-    mo.threads = 1;  // the parallelism is over atoms; nesting only oversubscribes
     // An atom is not the capture: it numbers its images within itself and its
     // model is one of hundreds. The loop below reports it in database ids once
     // it is done, and a snapshot from here would show one atom as "the model".
@@ -250,21 +305,57 @@ inline std::vector<Reconstruction> reconstructAtoms(
 
     const std::vector<std::vector<uint32_t>> adj = detail::pairAdjacency(db);
 
-    // An explicit count is taken literally; the default is capped, because the
-    // ceiling exists for the contexts (two 64 MB staging buffers each) and for
-    // a device that a handful of concurrent small solves already saturates.
-    unsigned hc = std::thread::hardware_concurrency();
-    int nt = opt.threads > 0 ? opt.threads
-                             : std::min(hc > 0 ? (int)hc : 1, std::max(1, opt.max_threads));
-    nt = std::max(1, std::min<int>(nt, (int)std::max<size_t>(atoms.size(), 1)));
-    st.threads = nt;
-    if (base.host_budget_bytes)
-        mo.host_budget_bytes = std::max<size_t>(1, base.host_budget_bytes / static_cast<size_t>(nt));
+    // Hardware slots are shared by outer tasks and their internal host passes.
+    // Every task also holds aggregate host/device credits until its models spill.
+    const unsigned hc = std::max(1u, std::thread::hardware_concurrency());
+    const unsigned cpuSlots = base.threads > 0 ? std::min<unsigned>(hc, unsigned(base.threads)) : hc;
+    const auto wantedReal = realCfgFromName(mo.ba_real), wantedCoarse = realCfgFromName(mo.ba_real_coarse);
+    VkDeviceCaps capabilities;
+    if (wantedReal != RealCfg::CPU || wantedCoarse != RealCfg::CPU) capabilities = mo.device_selector.empty() ? VkContext::probeCaps(deviceOnlyOpt(mo.device, mo.device_selector)) : cachedDeviceCaps(mo.device_selector);
+    const auto chosen = pickRealForDevice(wantedReal, capabilities), chosenCoarse = pickRealForDevice(wantedCoarse, capabilities);
+    const bool gpu = chosen != RealCfg::CPU || chosenCoarse != RealCfg::CPU;
+    std::unique_ptr<VkContext> firstContext; VkContextOptions atomContextOptions;
+    VkDeviceMemoryCapacity deviceCapacity;
+    uint64_t host = opt.host_budget_bytes ? opt.host_budget_bytes : base.host_budget_bytes;
+    const auto available = spirula::availableRamBytes();
+    if (!host) host = mappingMemoryLimits(spirula::physicalRamBytes(), available).working_bytes;
+    if (available) host = std::min<uint64_t>(host, available - std::min<uint64_t>(available / 8, 512u << 20));
+    uint64_t auxiliary = 0;
+    if (rigs) { auxiliary = atom_scheduling::add(auxiliary, rigs->of_image.capacity() * sizeof(RigSlot)); for (const auto& rig : rigs->rigs) { auxiliary = atom_scheduling::add(auxiliary, rig.members.capacity() * sizeof(RigMemberDef) + rig.frames.capacity() * sizeof(std::vector<uint32_t>)); for (const auto& frame : rig.frames) auxiliary = atom_scheduling::add(auxiliary, frame.capacity() * sizeof(uint32_t)); } }
+    if (seqs) { auxiliary = atom_scheduling::add(auxiliary, 12ull * seqs->seq.capacity() + 4ull * seqs->length.capacity()); for (const auto& rows : seqs->members) for (const auto& member : rows) auxiliary = atom_scheduling::add(auxiliary, member.capacity() + sizeof(std::string)); }
+    const auto shared = atom_scheduling::add(detail::atomSharedInputBytes(db, feats, adj, base, atoms), atom_scheduling::add(opt.caller_owned_bytes, auxiliary));
+    std::vector<atom_scheduling::Job> forecasts; forecasts.reserve(atoms.size()); std::vector<uint8_t> membership(db.images.size());
+    uint64_t retained = 0;
+    for (const auto& atom : atoms) { forecasts.push_back(detail::forecastAtomResources(db, feats, adj, atom, mo, gpu, auxiliary, membership)); if (!sink) retained = atom_scheduling::add(retained, forecasts.back().model_bytes); }
+    const auto fixedHost = atom_scheduling::add(shared, atom_scheduling::add(retained, forecasts.capacity() * sizeof(atom_scheduling::Job) + membership.capacity() + (1u << 20)));
+    if (fixedHost >= host) throw std::length_error("atom shared inputs/retained outputs exceed aggregate RAM budget");
+    if (gpu) {
+        uint64_t largest = 0; for (const auto& job : forecasts) largest = std::max(largest, job.credit.host);
+        if (atom_scheduling::add(largest, 128u << 20) > host - fixedHost)
+            throw std::length_error("atom RAM credits cannot hold first GPU context and one complete task");
+    }
+    if (gpu) {
+        firstContext = std::make_unique<VkContext>();
+        atomContextOptions.needFloat64 = chosen == RealCfg::F64 || chosenCoarse == RealCfg::F64;
+        atomContextOptions.needFloatAtomics = (chosen != RealCfg::CPU && chosen != RealCfg::DF64) || (chosenCoarse != RealCfg::CPU && chosenCoarse != RealCfg::DF64);
+        atomContextOptions.needInt64Atomics = chosen == RealCfg::DF64 || chosenCoarse == RealCfg::DF64;
+        atomContextOptions.selector = mo.device_selector; atomContextOptions.deviceIndex = mo.device;
+        firstContext->init(atomContextOptions); deviceCapacity = firstContext->deviceMemoryCapacity();
+        if (deviceCapacity.available_bytes <= deviceCapacity.reserve_bytes) throw std::length_error("atom GPU capacity unavailable after driver safety reserve");
+    }
+    atom_scheduling::Limits limits; limits.hardware = cpuSlots; limits.requested = opt.threads > 0 ? uint32_t(opt.threads) : 0;
+    if (opt.max_threads > 0) limits.requested = limits.requested ? std::min(limits.requested, uint32_t(opt.max_threads)) : uint32_t(opt.max_threads);
+    limits.host = host - fixedHost; limits.context_host = gpu ? 128u << 20 : 0;
+    limits.device = gpu ? deviceCapacity.available_bytes - deviceCapacity.reserve_bytes : 0;
+    if (gpu && opt.device_budget_bytes) limits.device = std::min<uint64_t>(limits.device, opt.device_budget_bytes);
+    limits.context_device = gpu ? 128u << 20 : 0; limits.first_device_context_accounted = gpu;
+    const auto scheduling = atom_scheduling::plan(forecasts, limits); const int nt = int(scheduling.workers); st.threads = nt;
+    atom_scheduling::Pool resources(forecasts, scheduling.pool, cpuSlots, scheduling.workers);
+    if (opt.verbose) slog::diag(slog::Tag::Map, "[bup] resource-adaptive atom workers %d/%u CPU slots (requested %d); shared/retained %.1f MiB, host pool %.1f MiB, device pool %.1f MiB, context reservations host %.1f/device %.1f MiB; driver budget %s\n", nt, cpuSlots, opt.threads, fixedHost / 1048576., scheduling.pool.host / 1048576., scheduling.pool.device / 1048576., scheduling.contexts_host / 1048576., scheduling.contexts_device / 1048576., gpu ? (deviceCapacity.budget_known ? "available" : "conservative fallback") : "native CPU");
 
     std::vector<std::vector<Reconstruction>> per_atom(atoms.size());
     std::vector<size_t> model_counts(atoms.size(), 0);
     std::vector<size_t> registrations(atoms.size(), 0);
-    std::atomic<size_t> next{0};
     std::mutex log_mu;
     std::atomic<size_t> done{0};
     // A worker whose device fails has to report itself: an exception crossing
@@ -273,21 +364,29 @@ inline std::vector<Reconstruction> reconstructAtoms(
     std::mutex err_mu;
     std::exception_ptr first_error;
 
-    auto worker = [&] {
+    auto worker = [&](int workerIndex) {
         try {
             // One context for every atom this worker builds. Creating a Vulkan
             // device takes longer than reconstructing an atom, and it cannot be
             // shared with another thread.
-            VkContext ctx;
+            VkContext ownedContext; VkContext& ctx = workerIndex == 0 && firstContext ? *firstContext : ownedContext;
+            if (gpu && !ctx.initialized()) ctx.init(atomContextOptions);
             std::vector<uint32_t> local(db.images.size(), UINT32_MAX);
-            for (size_t i = next++; i < atoms.size(); i = next++) {
+            for (;;) {
+                const auto lease = resources.acquire(); const size_t i = lease.task; if (i == atoms.size()) break;
+                struct Release { atom_scheduling::Pool& pool; size_t task; ~Release() { pool.release(task); } } release{resources, i};
+                MapperOptions taskOptions = mo; taskOptions.threads = int(lease.threads);
+                taskOptions.host_budget_bytes = size_t(forecasts[i].solver_host); taskOptions.device_budget_bytes = size_t(forecasts[i].solver_device);
                 detail::SubDatabase sub =
                     detail::carveAtom(db, feats, cam_ids, adj, atoms[i], local, rigs, seqs, priors);
-                Mapper m(sub.db, sub.feats, mo, sub.cam_ids, rigs ? &sub.rigs : nullptr,
+                Mapper m(sub.db, sub.feats, taskOptions, sub.cam_ids, rigs ? &sub.rigs : nullptr,
                          seqs ? &sub.seqs : nullptr, sub.priors.get());
                 m.useBaContext(&ctx);
                 uint32_t reg = 0;
-                for (Reconstruction& r : m.run()) {
+                auto built = m.run(); uint64_t returnedBytes = 0;
+                for (const auto& rec : built) returnedBytes = atom_scheduling::add(returnedBytes, modelResidentBytes(rec));
+                if (returnedBytes > forecasts[i].model_bytes) throw std::length_error("atom returned models exceed admitted model memory forecast");
+                for (Reconstruction& r : built) {
                     if (r.numRegistered() < 2) continue;
                     detail::toGlobalIds(r, sub.to_global);
                     reg += r.numRegistered();
@@ -304,25 +403,27 @@ inline std::vector<Reconstruction> reconstructAtoms(
                     const size_t n = ++done;
                     std::lock_guard<std::mutex> lk(log_mu);
                     slog::diag(slog::Tag::Map,
-                               "[bup] atom %zu/%zu: %zu images -> %zu model(s), %u registered",
-                               n, atoms.size(), atoms[i].size(), model_counts[i], reg);
+                               "[bup] atom %zu/%zu: %zu images -> %zu model(s), %u registered; CPU lease %u, returned models %.1f MiB / forecast %.1f MiB, task host/device credits %.1f/%.1f MiB",
+                               n, atoms.size(), atoms[i].size(), model_counts[i], reg, lease.threads, returnedBytes / 1048576., forecasts[i].model_bytes / 1048576., forecasts[i].credit.host / 1048576., forecasts[i].credit.device / 1048576.);
                 }
             }
         } catch (...) {
             std::lock_guard<std::mutex> lk(err_mu);
             if (!first_error) first_error = std::current_exception();
-            next = atoms.size();  // nothing left for the others to claim
+            resources.stop();
         }
     };
     if (nt == 1) {
-        worker();
+        worker(0);
     } else {
         std::vector<std::thread> pool;
         pool.reserve(nt);
-        for (int t = 0; t < nt; t++) pool.emplace_back(worker);
+        for (int t = 0; t < nt; t++) pool.emplace_back(worker, t);
         for (std::thread& t : pool) t.join();
     }
     if (first_error) std::rethrow_exception(first_error);
+    const auto resourceStats = resources.stats();
+    if (opt.verbose) slog::diag(slog::Tag::Map, "[bup] atom reservation peaks: %u active tasks, %u/%u CPU leases, host credits %.1f/%.1f MiB, device credits %.1f/%.1f MiB; %llu resource waits\n", resourceStats.peak_active, resourceStats.peak_cpu, cpuSlots, resourceStats.peak_host / 1048576., scheduling.pool.host / 1048576., resourceStats.peak_device / 1048576., scheduling.pool.device / 1048576., (unsigned long long)resourceStats.waits);
 
     std::vector<Reconstruction> models;
     st.models = 0;

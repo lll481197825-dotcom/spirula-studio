@@ -1,6 +1,7 @@
 #include "sfm/map/RegionalQuality.h"
 #include "sfm/map/RegionalWindows.h"
 #include "sfm/map/RegionalLandmarks.h"
+#include "sfm/map/RegionalAdjustment.h"
 #include "sfm/tests/TestMain.h"
 #include <chrono>
 #include <cstring>
@@ -73,6 +74,45 @@ static void triangulationBenchmark(const Reconstruction& input, const std::set<u
                 serial.points3D.size(), seconds, elapsed, seconds / elapsed);
 }
 
+static void fusedQualityTest(const std::filesystem::path& root) {
+    auto poses = fixture(false); regional::SharedIndex shared; shared.by_model.resize(2);
+    for (size_t m = 0; m < 2; ++m) {
+        auto rec = poses;
+        if (m) rec.points3D.at(0).xyz.z = -5;
+        regional::atomicModel(root / ("fused-" + std::to_string(m) + ".bin"), rec);
+        regional::writeValidation(root / ("fused-validation-" + std::to_string(m) + ".bin"), rec, m);
+    }
+    auto read = [&](size_t m) { return model_store_detail::readModel(root / ("fused-" + std::to_string(m) + ".bin")); };
+    auto local = [&](size_t m, const Reconstruction& rec, const Reconstruction& committed,
+                     std::vector<regional::PhotoQuality>* photos) {
+        return regional::validationCost(root / ("fused-validation-" + std::to_string(m) + ".bin"), rec, committed, m, 3, 4, photos);
+    };
+    auto validate = [&](const Reconstruction& committed, const regional::SharedIndex& points,
+                        std::vector<regional::PhotoQuality>* photos) {
+        regional::Quality q; q.finite_cost = 0;
+        for (size_t m = 0; m < 2; ++m) {
+            auto rec = read(m); points.inject(m, rec);
+            regional::accumulateQuality(q, local(m, rec, committed, photos));
+        }
+        return q;
+    };
+    SfmConfig cfg; cfg.max_error = 3; cfg.threads = 4; VkContext context;
+    std::vector<regional::PhotoQuality> fused_photos(12), restored_photos(12);
+    auto actual = regional::refineRegionalQuality(2, read,
+        [&](size_t m, const Reconstruction& rec) { regional::atomicModel(root / ("fused-" + std::to_string(m) + ".bin"), rec); },
+        validate, poses, shared, {}, fused_photos, root / "fused-scratch", cfg, size_t(1) << 30, context,
+        nullptr, nullptr, {}, local);
+    auto expected = validate(poses, shared, &restored_photos);
+    require(actual.cost == expected.cost && actual.observations == expected.observations &&
+        actual.finite_cost == expected.finite_cost && actual.invalid_projections == expected.invalid_projections &&
+        actual.invalid_projections > 0, "fused validation changed original projection ledger");
+    for (size_t i = 0; i < fused_photos.size(); ++i) {
+        const auto& a = fused_photos[i]; const auto& b = restored_photos[i];
+        require(a.observations == b.observations && a.inliers == b.inliers && a.error == b.error &&
+            a.invalid_projections == b.invalid_projections, "fused validation changed per-photo acceptance");
+    }
+}
+
 static int test(int argc, char** argv) {
     namespace fs = std::filesystem;
     if (argc == 5 || argc == 7 || argc == 8) {
@@ -91,12 +131,25 @@ static int test(int argc, char** argv) {
         return 0;
     }
     auto root = fs::temp_directory_path() / ("sfm-quality-test-" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
-    fs::create_directories(root); auto rec = fixture(false);
+    fs::create_directories(root); fusedQualityTest(root); auto rec = fixture(false);
     regional::writeValidation(root / "validation.bin", rec, 7);
     auto q = regional::validationCost(root / "validation.bin", rec, rec, 7, 3);
     require(q.cost < 1e-10 && q.observations == 176, "validation omitted observations");
+    std::vector<regional::PhotoQuality> photos(rec.images.rbegin()->first + 1);
+    regional::validationCost(root / "validation.bin", rec, rec, 7, 3, 4, &photos);
+    uint64_t checked = 0; for (const auto& kv : rec.images) {
+        checked += photos.at(kv.first).observations;
+        require(photos.at(kv.first).inliers == photos.at(kv.first).observations && photos.at(kv.first).error < 1e-7,
+            "per-photo validation changed valid observation quality");
+    }
+    require(checked == q.observations, "per-photo validation omitted original observations");
+    require(regional::photoQualityAccepted(photos.at(4), 3), "well-constrained photo did not pass quality");
     auto poses = rec; poses.images.at(4).pose.t.x += .2;
     auto bad = regional::validationCost(root / "validation.bin", rec, poses, 7, 3);
+    photos.assign(photos.size(), {});
+    regional::validationCost(root / "validation.bin", rec, poses, 7, 3, 4, &photos);
+    require(!regional::photoQualityAccepted(photos.at(4), 3), "global average hid a bad individual camera");
+    require(!regional::photoQualityAccepted({}, 3), "photo without visual observations was accepted");
     require(bad.cost > 1 && regional::qualityStop(bad, q, q.cost, .001, false) == 2, "writeback pose degradation accepted");
     poses = rec; poses.cameras.at(0).fx *= 1.2;
     bad = regional::validationCost(root / "validation.bin", rec, poses, 7, 3);
@@ -106,6 +159,29 @@ static int test(int argc, char** argv) {
     require(rejected, "different observation sets accepted");
     require(regional::qualityStop({99, 176}, {100, 176}, 100, .001, false) == 0, "improvement stopped too early");
     require(regional::qualityStop({99.95, 176}, {100, 176}, 100, .001, false) == 1, "convergence not recognized");
+    poses = rec; poses.images.at(4).pose.t.z = -10;
+    photos.assign(photos.size(), {});
+    auto invalid = regional::validationCost(root / "validation.bin", rec, poses, 7, 3, 4, &photos);
+    require(invalid.invalid_projections == 16 && invalid.finite_cost < 1e-10 && invalid.observations == q.observations,
+        "invalid projections were hidden or treated as measured residuals");
+    require(photos.at(4).invalid_projections == 16 && !regional::photoQualityAccepted(photos.at(4), 3),
+        "invalid projection photo passed quality");
+    require(regional::qualityStop(invalid, invalid, invalid.cost, .001, false) == 0,
+        "invalid projection sentinel caused false convergence");
+    regional::Quality hidden_previous{1e32, 176, 100, 1}, hidden_candidate{1e32, 176, 110, 1};
+    require(regional::qualityStop(hidden_candidate, hidden_previous, 1e32, .001, false) == 2,
+        "invalid projection sentinel hid finite residual regression");
+    hidden_candidate.finite_cost = 90;
+    require(regional::qualityStop(hidden_candidate, hidden_previous, 1e32, .001, false) == 0,
+        "finite residual progress with invalid projections stopped early");
+    regional::writeProjectionQuality(root / "projection.bin", invalid);
+    auto restored = regional::readProjectionQuality(root / "projection.bin");
+    require(restored.cost == invalid.cost && restored.finite_cost == invalid.finite_cost &&
+        restored.invalid_projections == invalid.invalid_projections && restored.observations == invalid.observations,
+        "projection checkpoint lost original observation quality");
+    fs::resize_file(root / "projection.bin", fs::file_size(root / "projection.bin") - 1); rejected = false;
+    try { regional::readProjectionQuality(root / "projection.bin"); } catch (const std::exception&) { rejected = true; }
+    require(rejected, "truncated projection checkpoint accepted");
     regional::writeValidation(root / "validation.bin", rec, 7);
     regional::atomicModel(root / "model.bin", rec); regional::atomicModel(root / "model.bin", poses);
     require(model_store_detail::readModel(root / "model.bin").cameras.at(0).fx == poses.cameras.at(0).fx, "checkpoint replacement failed");

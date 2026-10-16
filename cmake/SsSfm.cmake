@@ -104,6 +104,7 @@ endforeach()
 # watches, comma-separated defines. The matcher is built four times: with and
 # without the integer dot product, at 128- and 256-byte descriptors.
 foreach(stage sift:sift/sift.slang:sift:none
+              quality_double_huber:quality/quality.slang:quality:-DREAL_DOUBLE,-DLOSS_HUBER
               match:match/bruteforce.slang:match:none
               match_nodot:match/bruteforce.slang:match:-DNO_DOT4
               match_d256:match/bruteforce.slang:match:-DDESC_WORDS=64
@@ -203,6 +204,9 @@ file(GLOB SS_SFM_TESTS CONFIGURE_DEPENDS ${SS_SFM_SRC}/tests/*.cpp)
 foreach(test_src ${SS_SFM_TESTS})
     get_filename_component(test_name ${test_src} NAME_WE)
     add_executable(${test_name} ${test_src})
+    if(WIN32)
+        target_sources(${test_name} PRIVATE ${SS_SRC}/app/utf8.manifest)
+    endif()
     target_link_libraries(${test_name} PRIVATE ss_sfm)
     set_property(TARGET ${test_name} PROPERTY CXX_STANDARD 17)
     target_compile_options(${test_name} PRIVATE

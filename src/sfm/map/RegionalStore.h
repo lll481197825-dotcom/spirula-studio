@@ -8,6 +8,7 @@
 
 #include "sfm/core/Cancel.h"
 #include "sfm/core/Features.h"
+#include "sfm/core/DiskStorage.h"
 #include "sfm/map/Merge.h"
 #include "sfm/map/ModelStore.h"
 #ifdef _WIN32
@@ -17,13 +18,12 @@
 namespace sfm::regional {
 namespace fs = std::filesystem;
 
+inline size_t regionalWorkingCache(size_t budget) {
+    return std::min<size_t>(size_t(2) << 30, budget / 8);
+}
+
 inline void replaceFile(const fs::path& tmp, const fs::path& path) {
-#ifdef _WIN32
-    if (!MoveFileExW(tmp.c_str(), path.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH))
-        throw std::system_error(int(GetLastError()), std::system_category(), "regional checkpoint replacement failed");
-#else
-    fs::rename(tmp, path);
-#endif
+    storage::replaceFile(tmp, path);
 }
 
 inline void atomicModel(const fs::path& path, const Reconstruction& model) {
@@ -145,6 +145,7 @@ template<class T> inline bool nextRecord(std::istream& in, T& value) {
 
 // The fan-in bounds file handles and per-stream buffers as well as the sort chunks.
 inline fs::path sortObservations(const fs::path& input, const fs::path& dir, size_t memory) {
+    storage::requireSpace(dir, storage::scaleBytes(fs::file_size(input), 2));
     fs::create_directories(dir);
     std::vector<fs::path> runs;
     uint64_t sequence = 0;
@@ -161,6 +162,10 @@ inline fs::path sortObservations(const fs::path& input, const fs::path& dir, siz
         fs::path p = dir / (std::to_string(sequence++) + ".bin");
         std::ofstream out(p, std::ios::binary);
         for (const auto& x : chunk) record(out, x);
+        out.flush();
+        if (!out) throw std::runtime_error("cannot flush regional sort chunk");
+        out.close();
+        if (!out) throw std::runtime_error("cannot close regional sort chunk");
         runs.push_back(p);
     }
     if (runs.empty()) {
@@ -187,7 +192,11 @@ inline fs::path sortObservations(const fs::path& input, const fs::path& dir, siz
                 Head h = heap.top(); heap.pop(); record(out, h.row);
                 if (nextRecord(streams[h.stream], h.row)) heap.push(h);
             }
-            out.close(); streams.clear();
+            out.flush();
+            if (!out) throw std::runtime_error("cannot flush regional sort run");
+            out.close();
+            if (!out) throw std::runtime_error("cannot close regional sort run");
+            streams.clear();
             for (size_t i = begin; i < end; ++i) fs::remove(runs[i]);
             merged.push_back(p);
         }
@@ -196,23 +205,47 @@ inline fs::path sortObservations(const fs::path& input, const fs::path& dir, siz
     return runs.front();
 }
 
+struct PointView { const Image* image; const Camera* camera; Vec2 xy; };
 inline Vec3 refineUnifiedPoint(Vec3 initial, const std::vector<Observation>& track,
-                               const Reconstruction& poses, double gate) {
+                               const Reconstruction& poses, double gate, std::vector<PointView>* workspace = nullptr) {
+    std::vector<PointView> local;
+    auto& views = workspace ? *workspace : local; views.clear(); views.reserve(track.size());
+    for (const auto& obs : track) {
+        const auto& image = poses.images.at(uint32_t(obs.point >> 32));
+        views.push_back({&image, &poses.cameras.at(image.camera_id), obs.xy});
+    }
+    struct Objective { uint64_t invalid = 0; double finite = 0; };
     auto cost = [&](const Vec3& xyz) {
-        double sum = 0;
-        for (const auto& obs : track) {
-            const Image& im = poses.images.at(uint32_t(obs.point >> 32));
-            const Camera& cam = poses.cameras.at(im.camera_id);
-            double e = reprojErrorAt(cam, im.pose, obs.xy, xyz) / cam.pixel_scale;
-            if (!std::isfinite(e)) return std::numeric_limits<double>::infinity();
-            sum += e <= gate ? e * e : gate * (2 * e - gate);
+        Objective result;
+        for (const auto& obs : views) {
+            const Image& im = *obs.image;
+            const Camera& cam = *obs.camera;
+            bool valid = true;
+            double e = reprojErrorAt(cam, im.pose, obs.xy, xyz, &valid) / cam.pixel_scale;
+            if (!valid || !std::isfinite(e)) { ++result.invalid; continue; }
+            result.finite += e <= gate ? e * e : gate * (2 * e - gate);
         }
-        return sum;
+        return result;
+    };
+    auto improves = [&](const Vec3& candidate, const Vec3& previous) {
+        const auto next = cost(candidate), before = cost(previous);
+        if (next.invalid > before.invalid || !std::isfinite(next.finite)) return false;
+        double next_common = 0, before_common = 0;
+        for (const auto& obs : views) {
+            bool a = true, b = true; const auto& cam = *obs.camera;
+            const double x = reprojErrorAt(cam, obs.image->pose, obs.xy, candidate, &a) / cam.pixel_scale;
+            const double y = reprojErrorAt(cam, obs.image->pose, obs.xy, previous, &b) / cam.pixel_scale;
+            if (!a || !b) continue;
+            next_common += x <= gate ? x * x : gate * (2 * x - gate);
+            before_common += y <= gate ? y * y : gate * (2 * y - gate);
+        }
+        return next_common <= before_common * (1 + 1e-10) + 1e-10 &&
+            (next.invalid < before.invalid || next.finite < before.finite);
     };
     Mat3 H{}; Vec3 g{0, 0, 0};
-    for (const auto& obs : track) {
-        const Image& im = poses.images.at(uint32_t(obs.point >> 32));
-        const Camera& cam = poses.cameras.at(im.camera_id);
+    for (const auto& obs : views) {
+        const Image& im = *obs.image;
+        const Camera& cam = *obs.camera;
         Vec3 c = cameraCenter(im.pose), d = mul(transpose(im.pose.R), cam.bearing(obs.xy)).normalized();
         double weight = std::pow(cam.focal() / std::max(1., (initial - c).norm()), 2);
         double v[3] = {d.x, d.y, d.z}; Mat3 A;
@@ -223,21 +256,24 @@ inline Vec3 refineUnifiedPoint(Vec3 initial, const std::vector<Observation>& tra
         g = g + mul(A, c);
     }
     bool ok = false; Vec3 ray = mul(inverse3(H, &ok), g);
-    double current = cost(initial);
-    if (ok && cost(ray) < current) { initial = ray; current = cost(ray); }
+    if (ok && std::isfinite(ray.norm()) && improves(ray, initial)) initial = ray;
     for (int iteration = 0; iteration < 5; ++iteration) {
         H = {}; g = {0, 0, 0};
-        for (const auto& obs : track) {
-            const Image& im = poses.images.at(uint32_t(obs.point >> 32));
-            const Camera& cam = poses.cameras.at(im.camera_id);
+        for (const auto& obs : views) {
+            const Image& im = *obs.image;
+            const Camera& cam = *obs.camera;
             Vec3 pc = mul(im.pose.R, initial) + im.pose.t; Vec2 px = cam.project(pc);
+            bool visible = true; reprojErrorAt(cam, im.pose, obs.xy, initial, &visible);
+            if (!visible || !std::isfinite(px.x) || !std::isfinite(px.y)) continue;
             double r[2] = {(px.x - obs.xy.x) / cam.pixel_scale, (px.y - obs.xy.y) / cam.pixel_scale};
+            if (cam.isSpherical()) r[0] = std::remainder(px.x - obs.xy.x, double(cam.width)) / cam.pixel_scale;
             double norm = std::hypot(r[0], r[1]), weight = norm > gate ? gate / norm : 1;
             double eps = std::max(1e-6, pc.norm() * 1e-6), J[2][3];
             for (int a = 0; a < 3; ++a) {
                 Vec3 moved = initial; if (a == 0) moved.x += eps; if (a == 1) moved.y += eps; if (a == 2) moved.z += eps;
                 Vec2 q = cam.project(mul(im.pose.R, moved) + im.pose.t);
-                J[0][a] = (q.x - px.x) / (eps * cam.pixel_scale); J[1][a] = (q.y - px.y) / (eps * cam.pixel_scale);
+                const double dx = cam.isSpherical() ? std::remainder(q.x - px.x, double(cam.width)) : q.x - px.x;
+                J[0][a] = dx / (eps * cam.pixel_scale); J[1][a] = (q.y - px.y) / (eps * cam.pixel_scale);
             }
             double gradient[3]{};
             for (int a = 0; a < 3; ++a) {
@@ -250,8 +286,8 @@ inline Vec3 refineUnifiedPoint(Vec3 initial, const std::vector<Observation>& tra
         Vec3 step = mul(inverse3(H, &ok), g); if (!ok || !std::isfinite(step.norm())) break;
         bool accepted = false;
         for (double factor : {1., 0.5, 0.25}) {
-            Vec3 candidate = initial - step * factor; double next = cost(candidate);
-            if (next < current) { initial = candidate; current = next; accepted = true; break; }
+            Vec3 candidate = initial - step * factor;
+            if (improves(candidate, initial)) { initial = candidate; accepted = true; break; }
         }
         if (!accepted || step.norm() < 1e-7) break;
     }
@@ -261,6 +297,8 @@ inline Vec3 refineUnifiedPoint(Vec3 initial, const std::vector<Observation>& tra
 struct ExportStats {
     uint64_t images = 0, points = 0, observations = 0, conflicts = 0, cross_region_points = 0;
     size_t components = 0;
+    size_t photo_components = 0;
+    uint64_t photos_without_points = 0, min_photo_observations = 0;
     double error = 0, extraction_error = 0, median = 0;
 };
 
@@ -314,6 +352,14 @@ template<class ReadModel, class FeaturePath> inline ExportStats exportUnified(
     }
     fs::path ordered_tracks = sortObservations(tracks, scratch / "by-point", cache);
     ExportStats result; result.images = poses.numRegistered();
+    std::map<uint32_t, uint32_t> photo_parent;
+    std::map<uint32_t, uint64_t> photo_observations;
+    for (const auto& kv : poses.images) if (kv.second.registered) {
+        photo_parent[kv.first] = kv.first; photo_observations[kv.first] = 0;
+    }
+    auto photo_component = [&](uint32_t i) {
+        while (photo_parent.at(i) != i) { photo_parent[i] = photo_parent.at(photo_parent.at(i)); i = photo_parent.at(i); } return i;
+    };
     std::map<uint32_t, uint32_t> connected;
     if (owners) for (const auto& kv : poses.images) if (kv.second.registered) connected[owners->at(kv.first)] = owners->at(kv.first);
     auto component = [&](uint32_t i) { while (connected.at(i) != i) i = connected.at(i); return i; };
@@ -342,6 +388,11 @@ template<class ReadModel, class FeaturePath> inline ExportStats exportUnified(
                 accepted.push_back(obs); residuals.push_back(error); sum += error; scaled += error / cam.pixel_scale;
             }
             if (accepted.size() < 2) continue;
+            uint32_t photo_root = photo_component(uint32_t(accepted.front().point >> 32));
+            for (const auto& obs : accepted) {
+                uint32_t image = uint32_t(obs.point >> 32);
+                ++photo_observations.at(image); photo_parent[photo_component(image)] = photo_root;
+            }
             if (owners) {
                 uint32_t first = owners->at(uint32_t(accepted.front().point >> 32)); bool bridge = false;
                 for (const auto& obs : accepted) {
@@ -407,6 +458,12 @@ template<class ReadModel, class FeaturePath> inline ExportStats exportUnified(
     }
     points.flush();
     for (const auto& kv : connected) if (kv.first == component(kv.first)) result.components++;
+    result.min_photo_observations = result.images ? UINT64_MAX : 0;
+    for (const auto& kv : photo_observations) {
+        result.photo_components += photo_component(kv.first) == kv.first;
+        result.photos_without_points += kv.second == 0;
+        result.min_photo_observations = std::min(result.min_photo_observations, kv.second);
+    }
     result.error = result.observations ? result.error / result.observations : 0;
     result.extraction_error = result.observations ? result.extraction_error / result.observations : 0;
     return result;

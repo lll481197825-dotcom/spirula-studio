@@ -12,6 +12,7 @@
 #include <algorithm>
 #include <array>
 #include <cmath>
+#include <functional>
 #include <random>
 #include <vector>
 
@@ -287,14 +288,10 @@ inline bool refineFramePose(const std::vector<FrameMember>& members, Pose& rig_f
     return pose_detail::lmRefine((int)idx.size(), resid, 6, rig_from_world, s0, max_iters);
 }
 
-// LO-RANSAC PnP over 2D-3D correspondences given as world points `X` and unit
-// bearings `b`. `max_error_px` is converted to normalized units via `focal`.
-// `max_trials` caps the RANSAC budget. The default is the mapper's; a caller
-// that runs this over every image of a model at once (the D44 audit) pays the
-// full budget on every image whose correspondences are noise, which is most of
-// them, and does not need the deep search.
+// Pose eligibility is checked before consensus ranking and after local refits.
 inline PnPResult ransacPnP(const std::vector<Vec3>& X, const std::vector<Vec3>& b, double focal,
-                           double max_error_px = 4.0, unsigned seed = 0, int max_trials = 3000) {
+                           double max_error_px = 4.0, unsigned seed = 0, int max_trials = 3000,
+                           const std::function<bool(const Pose&)>& eligible = {}) {
     PnPResult out;
     int n = (int)X.size();
     if (n < 4) return out;
@@ -304,9 +301,15 @@ inline PnPResult ransacPnP(const std::vector<Vec3>& X, const std::vector<Vec3>& 
     auto fit = [&](const std::vector<int>& s) {
         std::array<Vec3, 3> br, Xs;
         for (int k = 0; k < 3; k++) { br[k] = b[s[k]]; Xs[k] = X[s[k]]; }
-        return p3p(br, Xs);
+        auto models = p3p(br, Xs);
+        if (eligible) models.erase(std::remove_if(models.begin(), models.end(), [&](const Pose& p) { return !eligible(p); }), models.end());
+        return models;
     };
-    auto refit = [&](const std::vector<int>& s) { return estimatePoseDLT(X, b, s); };
+    auto refit = [&](const std::vector<int>& s) {
+        auto models = estimatePoseDLT(X, b, s);
+        if (eligible) models.erase(std::remove_if(models.begin(), models.end(), [&](const Pose& p) { return !eligible(p); }), models.end());
+        return models;
+    };
     auto res = [&](const Pose& p, int i) { return pnpResidualSq(p, X[i], b[i]); };
     RansacOptions ro;
     ro.max_error = max_error_px / focal;  // residual is in normalized units

@@ -80,6 +80,31 @@ class BundleSolver {
     static constexpr uint32_t kCamBlk = kMaxPlainDof * (kMaxPlainDof + 1) / 2;
 
 public:
+    struct DeviceFootprint { uint64_t dense = 0, cg = 0, coupledFallback = 0, upper = 0, hostTables = 0; };
+    static DeviceFootprint forecastDeviceBuffers(BAProblem& problem, const SolverOptions& options) {
+        DeviceFootprint result; if (options.real == RealCfg::CPU) return result;
+        BundleSolver probe(problem, options); probe.pickTiers();
+        probe.obs32_ = std::all_of(problem.obs_xy.begin(), problem.obs_xy.end(), [](double v) { return double(float(v)) == v; });
+        probe.obsIdentity_ = problem.model_ranges.size() <= 1; probe.jac32_ = false;
+        const uint64_t pairEntries = pairEntryCount(problem);
+        const bool pair = exclusiveGroups(problem) && problem.num_obs && pairEntries <= kMaxPairEntries;
+        const uint64_t packed = uint64_t(problem.n_dim) * (problem.n_dim + 1) / 2;
+        const bool dense = packed <= 0x7fffffffull;
+        ::planCoarse(problem, kTcMaxDim, probe.tcK_, probe.tcN_, probe.tcEntries_);
+        auto bytes = [](double mb) { const long double n = std::ceil(mb * (1024.L * 1024.L)) + (2u << 20); if (n > UINT64_MAX) throw std::length_error("native BA device forecast overflow"); return uint64_t(n); };
+        if (dense) result.dense = bytes(probe.estimateMB(true, false, pair, pair ? pairEntries : 0));
+        result.cg = bytes(probe.estimateMB(false, true, false, 0));
+        result.coupledFallback = dense && pair ? bytes(probe.estimateMB(true, false, true, pairEntries) + probe.estimateMB(false, true, false, 0)) : result.cg;
+        if (options.solver == SolverSel::Dense) result.upper = result.dense;
+        else if (options.solver == SolverSel::CG && options.cg_fallback == CgFallback::Off) result.upper = result.cg;
+        else result.upper = std::max(result.dense, result.coupledFallback);
+        result.hostTables = probe.hostTableForecast(dense && pair && options.solver != SolverSel::CG,
+            options.solver != SolverSel::Dense);
+        if (options.solver == SolverSel::CG && options.cg_fallback != CgFallback::Off && dense && pair)
+            result.hostTables = probe.hostTableForecast(true, true);
+        if (!result.upper) throw std::length_error("native BA forecast has no supported device path");
+        return result;
+    }
     // With `shared` the solver runs on a caller-owned persistent context:
     // device, pipelines and descriptor machinery are created once and reused
     // across solver instances (the mapper's periodic global BAs), and only the
@@ -100,6 +125,11 @@ public:
     }
 
     void init() {
+        validateBAPointKinds(P_);
+        bacpu::validateDirectionalProjectionDomains(P_);
+        pointKinds_ = P_.point_kinds;
+        pointKindOffset_ = P_.pointKindTableOffset();
+        haveDirections_ = std::find(pointKinds_.begin(), pointKinds_.end(), uint8_t(1)) != pointKinds_.end();
         auto prof_t0 = std::chrono::steady_clock::now();
         auto prof_lap = [&prof_t0] {
             auto t1 = std::chrono::steady_clock::now();
@@ -225,7 +255,7 @@ public:
         bExts_ = mkReal(P_.exts.size());
         bIntr_ = mkReal(P_.total_intr);
         bPoints_ = mkReal(3 * (uint64_t)P_.num_points);
-        bObsRanges_ = mkUint(uint64_t(P_.num_points) + 1 + P_.fixed_points.size() + P_.fixed_frames.size());
+        bObsRanges_ = mkUint(uint64_t(P_.num_points) + 1 + P_.fixed_points.size() + P_.fixed_frames.size() + P_.point_kinds.size());
         bModelObs_ = mkUint(obsIdentity_ ? 1 : P_.model_obs.size());
         bJcOff_ = mkUint(P_.num_obs);
         auto mkJac = [&](uint64_t n) {
@@ -462,10 +492,16 @@ public:
             {&bPoints_, points.data(), points.size()},
         };
         std::vector<uint32_t> point_ranges;
-        if (!P_.fixed_points.empty() || !P_.fixed_frames.empty()) {
-            point_ranges = P_.obs_ranges;
+        if (!P_.fixed_points.empty() || !P_.fixed_frames.empty() || !P_.point_kinds.empty()) {
+            point_ranges.reserve(P_.obs_ranges.size() + P_.fixed_points.size() + P_.fixed_frames.size() + P_.point_kinds.size());
+            point_ranges.insert(point_ranges.end(), P_.obs_ranges.begin(), P_.obs_ranges.end());
             point_ranges.insert(point_ranges.end(), P_.fixed_points.begin(), P_.fixed_points.end());
             point_ranges.insert(point_ranges.end(), P_.fixed_frames.begin(), P_.fixed_frames.end());
+            // Appended uint32 kinds keep both existing mask offsets unchanged.
+            if (!P_.point_kinds.empty()) {
+                if (point_ranges.size() != P_.pointKindTableOffset()) throw std::runtime_error("BA device point-kind offset differs");
+                point_ranges.insert(point_ranges.end(), P_.point_kinds.begin(), P_.point_kinds.end());
+            }
             up[5] = {&bObsRanges_, point_ranges.data(), point_ranges.size() * 4};
         }
         if (!P_.members.empty()) {
@@ -526,6 +562,9 @@ public:
     // The host solver works on the problem's own parameter vectors, so upload
     // and download are the identity there.
     void uploadParams() {
+        if (P_.point_kinds != pointKinds_) throw std::runtime_error("BA landmark kinds changed after initialization");
+        validateBAPointKinds(P_);
+        if (P_.pointKindTableOffset() != pointKindOffset_) throw std::runtime_error("BA point-kind mask layout changed after initialization");
         if (cpu_) return;
         std::vector<uint8_t> poses, exts, intr, points;
         packReals(poses, P_.poses.data(), P_.poses.size(), opt_.real);
@@ -542,6 +581,8 @@ public:
     }
 
     void downloadParams() {
+        if (P_.point_kinds != pointKinds_ || P_.pointKindTableOffset() != pointKindOffset_)
+            throw std::runtime_error("BA download landmark-kind layout changed after initialization");
         if (cpu_) return;
         std::vector<uint8_t> tmp(std::max({bPoses_.size, bIntr_.size, bPoints_.size, bExts_.size}));
         ctx_.download(bPoses_, tmp.data(), P_.poses.size() * realSize(opt_.real));
@@ -554,7 +595,9 @@ public:
         ctx_.download(bIntr_, tmp.data(), P_.intr.size() * realSize(opt_.real));
         unpackReals(P_.intr, tmp.data(), P_.intr.size(), opt_.real);
         ctx_.download(bPoints_, tmp.data(), P_.points.size() * realSize(opt_.real));
-        unpackReals(P_.points, tmp.data(), P_.points.size(), opt_.real);
+        if (!haveDirections_) unpackReals(P_.points, tmp.data(), P_.points.size(), opt_.real);
+        else for (uint32_t point = 0; point < P_.num_points; ++point) if (!P_.directionalPoint(point))
+            for (uint32_t axis = 0; axis < 3; ++axis) P_.points[3ull * point + axis] = unpackRealAt(tmp.data(), 3ull * point + axis, opt_.real);
         if (!P_.exts.empty()) {
             ctx_.download(bExts_, tmp.data(), P_.exts.size() * realSize(opt_.real));
             unpackReals(P_.exts, tmp.data(), P_.exts.size(), opt_.real);
@@ -562,6 +605,9 @@ public:
     }
 
     double computeCost() {
+        if (P_.point_kinds != pointKinds_) throw std::runtime_error("BA landmark kinds changed after initialization");
+        validateBAPointKinds(P_);
+        if (P_.pointKindTableOffset() != pointKindOffset_) throw std::runtime_error("BA point-kind mask layout changed after initialization");
         if (cpu_) return cpu_->computeCost();
         beginSeg();
         recordCost();
@@ -615,6 +661,8 @@ public:
         auto t0 = std::chrono::high_resolution_clock::now();
         double damping = opt_.init_damping;
         double cost = computeCost();
+        if (!P_.point_kinds.empty() && !std::isfinite(cost))
+            throw std::runtime_error("BA initial typed landmark projection is invalid");
         double prior = priorCost(hostPoses_, hostExts_);
         stats_.initial_cost = cost;
         stats_.prior_initial = prior;
@@ -882,6 +930,33 @@ private:
         if (t1 > 0) meanTrackT_ = t2 / t1;
     }
 
+    uint64_t hostTableForecast(bool withPair, bool withCG) const {
+        long double bytes = 65536;
+        bytes += 5.L * P_.point_kinds.size();
+        auto growth = [&](long double desired, size_t capacity, size_t width) { if (desired > capacity) bytes += desired * width; };
+        const long double images = P_.num_images, pairs = images * (images + 1) / 2;
+        if (withPair) {
+            const uint64_t entries = pairEntryCount(P_);
+            bytes += 8 * (pairs + 1);
+            growth(2.L * entries, P_.pair_entries.capacity(), 4);
+            growth(4 * (pairs + entries / 1024.L + 1), P_.pair_chunks.capacity(), 4);
+        }
+        if (withCG) {
+            bytes += 4 * images;
+            growth(images + 1, P_.cam_obs_ranges.capacity(), 4);
+            growth(P_.num_obs, P_.cam_obs.capacity(), 4);
+            growth(6 * (images + P_.num_obs / 1024.L + 1), P_.cam_chunks.capacity(), 4);
+            growth(4 * (P_.num_frames + P_.members.size() + P_.groups.size()), P_.prec_blocks.capacity(), 4);
+            if (tcN_) {
+                const long double clusters = (P_.num_frames + tcK_ - 1) / tcK_, keys = clusters * (clusters + 1) / 2;
+                bytes += 8.L * tcEntries_ + 24 * (keys + tcEntries_ / 128.L + 1);
+                uint64_t largest = 0; for (uint32_t point = 0; point < P_.num_points; ++point) largest = std::max<uint64_t>(largest, P_.obs_ranges[point + 1] - P_.obs_ranges[point]);
+                bytes += 8.L * largest;
+            }
+        }
+        if (bytes > UINT64_MAX) throw std::length_error("native BA host table forecast overflow"); return uint64_t(std::ceil(bytes));
+    }
+
     static std::string costEntry(const BAProblem::ModelRange& mr) {
         return std::string(kModels[mr.model].cost_entry) + (mr.rig ? "_rig" : "");
     }
@@ -901,8 +976,13 @@ private:
         const bool denseOk = packed <= 0x7FFFFFFFull;  // 32-bit packed indexing
         const uint64_t pairEntries = pairEntryCount(P_);
         const bool cgOk = P_.num_obs > 0;
-        const double budget = opt_.vram_budget_mb > 0 ? opt_.vram_budget_mb
-                                                      : 0.9 * ctx_.deviceLocalHeapMB();
+        double budget = opt_.vram_budget_mb > 0 ? opt_.vram_budget_mb
+                                               : 0.9 * ctx_.deviceLocalHeapMB();
+        if (opt_.over_budget_throws && opt_.vram_budget_mb > 0) {
+            const auto capacity = ctx_.deviceMemoryCapacity();
+            budget = std::min(budget, double(capacity.available_bytes - capacity.reserve_bytes) /
+                                      (1024.0 * 1024.0));
+        }
         // Jacobians in Real unless the solve then misses the budget or needs more
         // than kMaxJacChunks buffers for them, where fp32 (ba.slang kJac32) is what
         // stands between it and the host solver. SS_SFM_BA_JAC32=0/1 forces either.
@@ -1000,6 +1080,9 @@ private:
         }
 
         // host tables for the chosen paths
+        const uint64_t hostTables = hostTableForecast((!useCG_ || haveFallback_) && pairOk, useCG_);
+        if (opt_.host_budget_bytes && hostTables > opt_.host_budget_bytes)
+            throw BAOverBudget(double(hostTables) / 1048576., double(opt_.host_budget_bytes) / 1048576., "host tables");
         P_.use_pair_schur = false;
         if ((!useCG_ || haveFallback_) && pairOk) buildPairTables(P_);
         densePath_ = P_.use_pair_schur ? LinSolve::DensePair : LinSolve::DenseObs;
@@ -1057,6 +1140,7 @@ private:
         b += 4 * (np + 1);
         b += 4 * P_.fixed_points.size();
         b += 4 * P_.fixed_frames.size();
+        b += 4 * P_.point_kinds.size();
         b += ((double)P_.jc_total + 8 * no) * (double)jacSize();  // Jc, Jp, res
         b += (9 + 3 + 9) * np * rs;                                // App, Bp, W
         b += 2 * n * rs;                                           // g, y
@@ -1376,12 +1460,14 @@ private:
         for (auto& mr : P_.model_ranges) {
             Push p;
             p.f0 = opt_.loss_param;
+            p.u3 = P_.pointKindTableOffset();
             launch(costEntry(mr), mr.count, 256, kWCost, p, atModel(mr));
         }
         ctx_.barrier(cb_);
     }
 
     void recordAssembly(float damping, bool reuse, LinSolve path) {
+        if (P_.point_kinds != pointKinds_) throw std::runtime_error("BA landmark kinds changed after initialization");
         const bool dense = path != LinSolve::CG;
         if (reuse) {
             // Params were restored after a reject; the per-observation
@@ -1414,6 +1500,7 @@ private:
                 Push p;
                 p.f0 = opt_.loss_param;
                 p.u2 = P_.fixed_points.empty() ? 0 : P_.num_points + 1;
+                p.u3 = P_.pointKindTableOffset();
                 launch(jacEntry(mr), mr.count, 128, kWJac * wide_, p, atModel(mr));
             }
             ctx_.barrier(cb_);
@@ -1778,6 +1865,9 @@ private:
     bool jac32_ = false;         // Jc, Jp and the residual stored at fp32 (decidePaths)
     bool obs32_ = false;         // every observation is a float, kept as one (ba.slang kObs32)
     bool obsIdentity_ = false;   // model_obs is the identity and not uploaded
+    bool haveDirections_ = false;
+    uint32_t pointKindOffset_ = 0;
+    std::vector<uint8_t> pointKinds_;
     size_t jacSize() const { return jac32_ ? 4 : realSize(opt_.real); }
     // Elements per Jc / Jp buffer (ba.slang kJcChunk / kJpChunk), 0 when one
     // holds them all, and how many of the four bindings each takes.

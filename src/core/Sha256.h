@@ -105,7 +105,8 @@ struct Sha256 {
 };
 
 // Lowercase hex SHA-256 of a file's contents. Empty when it cannot be read.
-inline std::string sha256_file(const std::string& path) {
+template <class Path>
+inline std::string sha256_file(const Path& path) {
     std::ifstream fin(path, std::ios::binary);
     if (!fin) return {};
     Sha256 sha;
@@ -116,6 +117,7 @@ inline std::string sha256_file(const std::string& path) {
         if (got > 0)
             sha.update(reinterpret_cast<const uint8_t*>(chunk.data()), (size_t)got);
     }
+    if (!fin.eof()) return {};
     return sha.hex();
 }
 

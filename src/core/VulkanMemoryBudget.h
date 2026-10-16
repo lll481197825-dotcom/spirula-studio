@@ -10,13 +10,14 @@ struct Budget {
     uint64_t budget_bytes = 0, usage_bytes = 0, available_bytes = 0;
 };
 
-inline Budget queryBudget(VkPhysicalDevice device) {
+inline Budget queryBudget(VkPhysicalDevice device, uint32_t heapIndex = VK_MAX_MEMORY_HEAPS) {
     VkPhysicalDeviceMemoryBudgetPropertiesEXT budget{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_BUDGET_PROPERTIES_EXT};
     VkPhysicalDeviceMemoryProperties2 properties{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_PROPERTIES_2};
     properties.pNext = &budget;
     vkGetPhysicalDeviceMemoryProperties2(device, &properties);
     Budget out;
     for (uint32_t i = 0; i < properties.memoryProperties.memoryHeapCount; ++i) {
+        if (heapIndex != VK_MAX_MEMORY_HEAPS && i != heapIndex) continue;
         if (!(properties.memoryProperties.memoryHeaps[i].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT)) continue;
         out.budget_bytes += budget.heapBudget[i];
         out.usage_bytes += budget.heapUsage[i];

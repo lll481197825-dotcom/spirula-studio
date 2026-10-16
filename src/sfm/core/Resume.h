@@ -42,6 +42,7 @@ std::filesystem::path dir(const std::string& workspace);
 // A stage's recorded signature, "" when it has none. `store` writes one and
 // `forget` removes it, which is how a stage says its output is no longer valid.
 std::string recorded(const std::filesystem::path& file);
+bool equivalentSignatures(const std::string& a, const std::string& b);
 void store(const std::filesystem::path& file, const std::string& signature);
 void forget(const std::filesystem::path& file);
 

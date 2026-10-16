@@ -82,6 +82,18 @@ static int test(int argc, char** argv) {
     fs::create_directories(root); std::vector<Reconstruction> models;
     for (uint32_t i = 0; i < 3; ++i) models.push_back(fixture(i));
     auto index = regional::buildSharedIndex(models.size(), [&](size_t i) { return models.at(i); }, root / "index", 1u << 20, 8u << 20);
+    for (size_t m = 0; m < models.size(); ++m)
+        model_store_detail::writeModel(models[m], root / ("model-" + std::to_string(m) + ".bin"));
+    auto thin_index = regional::buildSharedIndex(models.size(), [&](size_t i) { return models.at(i); },
+        root / "thin-index", 8u << 20, 8u << 20, 100000,
+        [&](size_t i) { return model_store_detail::readModel(root / ("model-" + std::to_string(i) + ".bin"), false); });
+    regional::writeSharedIndex(root / "full-index.bin", index);
+    regional::writeSharedIndex(root / "thin-index.bin", thin_index);
+    std::ifstream full_index_file(root / "full-index.bin", std::ios::binary), thin_index_file(root / "thin-index.bin", std::ios::binary);
+    require(std::vector<char>(std::istreambuf_iterator<char>(full_index_file), {}) ==
+        std::vector<char>(std::istreambuf_iterator<char>(thin_index_file), {}),
+        "metadata scan or working cache changed shared point/observation identities");
+    full_index_file.close(); thin_index_file.close();
     require(index.landmarks.size() == 80 && index.conflicts == 0, "shared identity indexing failed");
     for (const auto& p : index.landmarks) require(p.members.size() == 3 && p.observations.size() == 4, "shared observations not deduplicated");
     auto aligned = index; auto result = regional::alignSharedBlocks(aligned);
@@ -89,6 +101,15 @@ static int test(int argc, char** argv) {
     for (const auto& p : aligned.landmarks) for (const auto& member : p.members)
         require((member.xyz - p.xyz).norm() < 1e-8, "common landmarks remain inconsistent");
     require((transformPoint(result.transforms[0], {2, 3, 4}) - Vec3{2, 3, 4}).norm() < 1e-12, "reference gauge moved");
+    auto fixed_connected = index;
+    const auto fixed_fit = regional::alignSharedBlocks(fixed_connected, 50, 256u << 20, {0, 2});
+    require(fixed_fit.transforms[2].scale == 1. && fixed_fit.transforms[2].t.norm() < 1e-10 &&
+        (transformPoint(fixed_fit.transforms[2], {2, 3, 4}) - Vec3{2, 3, 4}).norm() < 1e-10,
+        "connected measured model lost its absolute GPS gauge");
+    auto all_fixed = index;
+    const auto all_fixed_fit = regional::alignSharedBlocks(all_fixed, 50, 256u << 20, {0, 1, 2});
+    for (const auto& t : all_fixed_fit.transforms)
+        require(t.scale == 1. && t.t.norm() < 1e-10, "all-measured block graph changed a certified frame");
     auto noisy = index; noisy.landmarks.clear();
     for (const auto& p : index.landmarks) for (uint32_t group = 0; group < 3; ++group) {
         auto q = p; q.key = p.key * 3 + group;
@@ -104,6 +125,21 @@ static int test(int argc, char** argv) {
     require(reduced.final_cost < reduced.initial_cost * .9999 && std::isfinite(reduced.rms), "joint loop objective did not improve");
     auto biased = index;
     for (auto& p : biased.landmarks) for (auto& m : p.members) if (m.model == 2) m.xyz.x += .02;
+    std::vector<regional::SharedGpsAnchor> gps_anchors;
+    for (size_t k = 0; k < index.landmarks.size(); ++k) {
+        const auto& p = index.landmarks[k]; const auto& member = p.members.back();
+        for (int repeat = 0; repeat < 20; ++repeat) gps_anchors.push_back({member.model, member.xyz, p.members.front().xyz});
+    }
+    auto gps_biased = biased, visual_biased = biased;
+    const auto visual_fit = regional::alignSharedBlocks(visual_biased);
+    const auto gps_fit = regional::alignSharedBlocks(gps_biased, 50, 256u << 20, {}, gps_anchors);
+    double visual_gps_error = 0, constrained_gps_error = 0;
+    for (const auto& a : gps_anchors) {
+        visual_gps_error += (transformPoint(visual_fit.transforms[a.model], a.centre) - a.position).norm();
+        constrained_gps_error += (transformPoint(gps_fit.transforms[a.model], a.centre) - a.position).norm();
+    }
+    require(constrained_gps_error < visual_gps_error * .2 && gps_fit.final_cost < gps_fit.initial_cost,
+        "joint block transform did not apply absolute GPS centre constraints");
     biased.alignment_reference = index.landmarks;
     auto guarded = regional::guardedSharedAlignment(biased);
     require(guarded.used_uniform && guarded.candidate_reference_cost > guarded.uniform_reference_cost,
@@ -111,9 +147,25 @@ static int test(int argc, char** argv) {
     auto disconnected = index; disconnected.models = 4; bool rejected = false;
     try { regional::alignSharedBlocks(disconnected); } catch (const std::runtime_error&) { rejected = true; }
     require(rejected, "disconnected blocks silently accepted");
+    auto positioned = disconnected;
+    auto anchored = regional::alignSharedBlocks(positioned, 50, 256u << 20, {3});
+    require(anchored.transforms.size() == 4 && anchored.transforms[3].scale == 1. &&
+        anchored.transforms[3].t.norm() < 1e-10, "measured disconnected component lost its fixed gauge");
+    regional::SharedIndex independent; independent.models = 2;
+    auto independent_fit = regional::alignSharedBlocks(independent, 50, 256u << 20, {0, 1});
+    require(independent_fit.transforms[0].scale == 1. && independent_fit.transforms[1].scale == 1., "measured components without visual edges moved");
+    bool absent = false;
+    try { regional::alignSharedBlocks(independent, 50, 256u << 20, {0}); }
+    catch (const std::runtime_error&) { absent = true; }
+    require(absent, "component without visual edges or measured gauge accepted");
     for (auto& p : aligned.landmarks) p.xyz = p.xyz + Vec3{.02, -.01, .05};
     double before = regional::sharedCost(aligned, models[0], 3);
+    auto serial_shared = aligned;
+    regional::triangulateShared(serial_shared, models[0], 3, 1);
     regional::triangulateShared(aligned, models[0], 3);
+    for (size_t k = 0; k < aligned.landmarks.size(); ++k)
+        require(std::memcmp(&aligned.landmarks[k].xyz, &serial_shared.landmarks[k].xyz, sizeof(Vec3)) == 0,
+            "parallel shared triangulation changed coordinates");
     require(regional::sharedCost(aligned, models[0], 3) < before * 1e-6, "shared triangulation did not improve reprojection");
     auto fixed = aligned.inject(1, models[1]); require(fixed.size() == 80, "local point IDs were conflated with another model");
     auto private_model = fixture(0);

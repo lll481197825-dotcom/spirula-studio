@@ -4450,6 +4450,21 @@ SS_MSG(block_radius_help,
     RU("Радиус GPS (м, 0: без ограничения)"),
     TR("GPS yarıçapı (m, 0: sınırsız)"));
 
+SS_MSG(regional_work_dir_help,
+    EN("Directory for all regional models, recovery, coordination and sorting; empty uses the dataset. Migrate existing checkpoints before changing it."),
+    JA("全分割モデル・復元・調整・並べ替えの保存先。空欄はデータセット。変更前に既存チェックポイントを移動してください。"),
+    ZH_HANS("存放全部分块模型、恢复、协调和排序文件；留空使用数据集目录。修改前须迁移已有检查点。"),
+    ZH_HANT("存放全部分塊模型、恢復、協調和排序檔案；留空使用資料集目錄。修改前須遷移已有檢查點。"),
+    KO("분할 모델, 복구, 조정 및 정렬 파일의 폴더. 비워두면 데이터셋을 사용합니다. 변경 전에 체크포인트를 옮기세요."),
+    DE("Ordner für regionale Modelle, Wiederherstellung, Abstimmung und Sortierung. Leer: Datensatz. Vor Änderungen vorhandene Prüfpunkte übertragen."),
+    FR("Dossier des modèles régionaux, de récupération, coordination et tri. Vide : jeu de données. Transférer les points de reprise avant de changer."),
+    ES("Carpeta para modelos, recuperación, coordinación y ordenación. Vacía: conjunto de datos. Migre los puntos de control antes de cambiarla."),
+    PT("Pasta de modelos, recuperação, coordenação e ordenação. Vazia: conjunto de dados. Transfira os pontos de controlo antes de alterar."),
+    IT("Cartella di modelli, recupero, coordinamento e ordinamento. Vuota: dataset. Trasferire i checkpoint prima di cambiarla."),
+    NL("Map voor regiomodellen, herstel, afstemming en sorteren. Leeg: dataset. Verplaats bestaande controlepunten voor een wijziging."),
+    RU("Папка моделей, восстановления, согласования и сортировки. Пусто: набор данных. Перед изменением перенесите контрольные точки."),
+    TR("Bölge modelleri, kurtarma, koordinasyon ve sıralama klasörü. Boş: veri kümesi. Değiştirmeden önce mevcut kontrol noktalarını taşıyın."));
+
 SS_MSG(block_cache_mb_help,
     EN("Host descriptor cache (MiB)"),
     JA("ホスト記述子キャッシュ (MiB)"),

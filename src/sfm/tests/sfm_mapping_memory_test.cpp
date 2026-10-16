@@ -44,7 +44,10 @@ static void testMemoryPolicy() {
         size_t working_mb, graph_mb, bundle_mb;
     };
     const Case cases[] = {
-        {32, 24, 0, 16384, 512, 8192},
+        {32, 24, 0, 20480, 512, 10240},
+        {32, 28, 0, 24576, 512, 12288},
+        {32, 17, 0, 13312, 512, 6656},
+        {32, 17, 12288, 12288, 512, 6144},
         {32, 8, 0, 6144, 512, 3072},
         {32, 8, 2048, 2048, 256, 1024},
         {32, 1, 0, 768, 96, 384},
@@ -58,6 +61,10 @@ static void testMemoryPolicy() {
                 limits.bundle_bytes == c.bundle_mb * mib,
                 "mapping memory policy exceeded its expected budget");
     }
+    require(mappingMemoryLimits(32 * gib, 32 * gib).working_bytes == 32 * gib - 32 * gib / 5,
+            "automatic memory policy exceeds physical headroom limit");
+    require(mappingMemoryLimits(32 * gib, 32 * gib, 1048576).working_bytes == 32 * gib - 32 * gib / 5,
+            "explicit memory policy can exceed physical capacity");
     require(availableBundleBudget(0) == 0, "unset bundle budget became a memory limit");
     std::puts("  mapping memory policy boundaries: PASS");
 }

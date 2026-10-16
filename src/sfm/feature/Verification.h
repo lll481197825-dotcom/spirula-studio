@@ -529,6 +529,7 @@ inline void bootstrapRectilinearFocals(const std::vector<FeatureSet>& feats,
 
 struct VerificationOptions {
     TwoViewOptions two_view;
+    bool report_events = true;
     // When set, pairs whose two images both have bearings are verified on the
     // sphere; `two_view.ransac.max_error` stays in pixels and is converted per
     // pair with the two cameras' focal lengths.
@@ -726,10 +727,10 @@ inline std::vector<TwoViewMatches> verifyPairs(
         // reported. A no-op without --progress-dir, and called from the
         // workers, which is what the lock inside it is for.
         const uint32_t inl = verifyBody(p, m, i, j);
-        progress::pair(i, j, inl);
+        if (opt.report_events) progress::pair(i, j, inl);
         if (inl) {
             const MatchList& kept = results[p].matches;
-            progress::live_pair(i, j, results[p].config,
+            if (opt.report_events) progress::live_pair(i, j, results[p].config,
                                 &kept[0].idx1, &kept[0].idx2,
                                 sizeof(FeatureMatch), (uint32_t)kept.size());
             if (opt.journal)
@@ -748,7 +749,7 @@ inline std::vector<TwoViewMatches> verifyPairs(
         e.image_a = i;
         e.image_b = j;
         e.inliers = inl;
-        events::emit(e);
+        if (opt.report_events) events::emit(e);
     };
 
     // How many pairs to ask the matcher for at once. Independent of the worker
@@ -762,7 +763,7 @@ inline std::vector<TwoViewMatches> verifyPairs(
     const size_t step = std::max<size_t>(1, pairs.size() / 400);
     const size_t ptotal = opt.progress_total ? opt.progress_total : pairs.size();
     auto tick = [&](size_t p) {
-        if ((p + 1) % step == 0 || p + 1 == pairs.size())
+        if (opt.report_events && ((p + 1) % step == 0 || p + 1 == pairs.size()))
             events::progress(Stage::Match, (int64_t)(opt.progress_done_base + p + 1),
                              (int64_t)ptotal);
     };

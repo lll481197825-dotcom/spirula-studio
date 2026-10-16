@@ -30,6 +30,28 @@
 
 namespace bacpu {
 
+inline void validateDirectionalProjectionDomains(const BAProblem& problem) {
+    validateBAPointKinds(problem);
+    if (problem.point_kinds.empty()) return;
+    for (uint32_t point = 0; point < problem.num_points; ++point) if (problem.directionalPoint(point)) {
+        for (uint32_t observation = problem.obs_ranges.at(point); observation < problem.obs_ranges.at(point + 1); ++observation) {
+            const auto image = problem.obs_image.at(observation), member = problem.image_member.at(image);
+            const auto& group = problem.groups.at(problem.image_group.at(image));
+            const auto* pose = &problem.poses.at(6ull * problem.image_frame.at(image));
+            withModel(group.model, [&](auto model) {
+                double residuals[2];
+                if (member == kNoMember) residual<decltype(model)>(pose, &problem.intr.at(group.intr_offset),
+                    &problem.points.at(3ull * point), &problem.obs_xy.at(2ull * observation), residuals, true);
+                else residualRig<decltype(model)>(pose, &problem.exts.at(problem.members.at(member).ext_offset),
+                    &problem.intr.at(group.intr_offset), &problem.points.at(3ull * point),
+                    &problem.obs_xy.at(2ull * observation), residuals, true);
+                if (!std::isfinite(residuals[0]) || !std::isfinite(residuals[1]))
+                    throw std::runtime_error("BA unit direction has an invalid initial camera projection");
+            });
+        }
+    }
+}
+
 class Solver {
     static constexpr uint32_t kCamBlk = kMaxCamDof * (kMaxCamDof + 1) / 2;
     static constexpr uint32_t kDenseMaxDim = 8192;
@@ -40,6 +62,9 @@ public:
     Solver(BAProblem& P, const SolverOptions& opt) : P_(P), opt_(opt) {}
 
     void init() {
+        validateBAPointKinds(P_);
+        validateDirectionalProjectionDomains(P_);
+        pointKinds_ = P_.point_kinds;
         n_ = P_.n_dim;
         poseDim_ = P_.pose_dim;
         nImg_ = P_.num_images;
@@ -70,6 +95,8 @@ public:
     }
 
     double computeCost() {
+        if (P_.point_kinds != pointKinds_) throw std::runtime_error("CPU BA landmark kinds changed after initialization");
+        validateBAPointKinds(P_);
         double total = 0;
         const int nt = taskCount(nObs_, 1 << 14, nthreads_);
         part_.assign(nt, 0.0);
@@ -86,11 +113,11 @@ public:
                         const double* pose = &P_.poses[6 * (size_t)frame_[img]];
                         if (eoff_[img] == kNoSlot)
                             residual<decltype(M)>(pose, &P_.intr[ioff_[img]],
-                                                  &P_.points[3 * (size_t)pt], &P_.obs_xy[2 * o], r);
+                                                  &P_.points[3 * (size_t)pt], &P_.obs_xy[2 * o], r, P_.directionalPoint(pt));
                         else
                             residualRig<decltype(M)>(pose, &P_.exts[eoff_[img]], &P_.intr[ioff_[img]],
                                                      &P_.points[3 * (size_t)pt], &P_.obs_xy[2 * o],
-                                                     r);
+                                                     r, P_.directionalPoint(pt));
                         c += 0.5 * LT::cost(r[0] * r[0] + r[1] * r[1], lossParam_);
                     });
                 }
@@ -106,6 +133,8 @@ public:
         auto t0 = std::chrono::high_resolution_clock::now();
         double damping = opt_.init_damping;
         double cost = computeCost();
+        if (!P_.point_kinds.empty() && !std::isfinite(cost))
+            throw std::runtime_error("BA initial typed landmark projection is invalid");
         double prior = lastPrior_;
         stats_.initial_cost = cost;
         stats_.prior_initial = prior;
@@ -347,6 +376,7 @@ private:
     double estimateMB(bool withDense, bool withCG) const {
         const double no = (double)nObs_, np = (double)nPts_, ni = (double)nImg_, n = (double)n_;
         double b = 0;
+        b += 2 * P_.point_kinds.size();  // Includes a possible delegating driver's immutable-kind copy.
         b += ((double)P_.jc_total + 6 * no) * (jac32_ ? 4 : 8) + 2 * no * 8;  // Jc, Jp, res
         b += (9 + 9 + 3 + 3) * np * 8;                        // App, W, Bp, Bp0
         b += (P_.pose_dim + P_.exts.size() + P_.total_intr + 3 * np) * 8;  // parameter backups
@@ -541,6 +571,7 @@ private:
              (tcEnt_.capacity() + tcKey_.capacity() + Jc32_.capacity() + Jp32_.capacity()) * 4;
         b += S_.bytes() + (P_.cam_obs.capacity() + P_.cam_obs_ranges.capacity() +
                            P_.cam_chunks.capacity() + P_.prec_blocks.capacity()) * 4;
+        b += pointKinds_.capacity();
         return (double)b / (1024.0 * 1024.0);
     }
 
@@ -661,6 +692,8 @@ private:
     // per range of points, so App/Bp need no atomics and every write is
     // sequential (observations are stored point-major).
     void jacobianPass() {
+        if (P_.point_kinds != pointKinds_) throw std::runtime_error("CPU BA landmark kinds changed after initialization");
+        validateBAPointKinds(P_);
         withLoss(opt_.loss, [&](auto L) {
             using LT = decltype(L);
             const int nt = taskCount(nPts_, 2048, nthreads_);
@@ -687,10 +720,10 @@ private:
                             if (rig)
                                 jacobianRig<MT>(pose, &P_.exts[eoff_[img]], &P_.intr[ioff_[img]],
                                                 &P_.points[3 * (size_t)p], &P_.obs_xy[2 * (size_t)o],
-                                                r, jcf, jpf);
+                                                r, jcf, jpf, P_.directionalPoint(uint32_t(p)));
                             else
                                 jacobian<MT>(pose, &P_.intr[ioff_[img]], &P_.points[3 * (size_t)p],
-                                             &P_.obs_xy[2 * (size_t)o], r, jcf, jpf);
+                                             &P_.obs_xy[2 * (size_t)o], r, jcf, jpf, P_.directionalPoint(uint32_t(p)));
                             const double sw =
                                 std::sqrt(LT::weight(r[0] * r[0] + r[1] * r[1], lossParam_));
                             for (int row = 0; row < 2; row++) {
@@ -1538,6 +1571,7 @@ private:
 
     uint32_t n_ = 0, poseDim_ = 0, tail_ = 0, nImg_ = 0, nPts_ = 0, nObs_ = 0;
     std::vector<uint8_t> dof_, gz_, model_, efree_, emask_;
+    std::vector<uint8_t> pointKinds_;
     std::vector<uint32_t> icol_, ioff_, frame_, eoff_;  // eoff_: into exts, or kNoSlot
     bool exclusive_ = true;
 

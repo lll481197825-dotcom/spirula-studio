@@ -52,6 +52,23 @@ static int test(int, char**) {
             "fixed landmark changed during BA");
         require((rec.points3D.at(1119).xyz - original.points3D.at(1119).xyz).norm() > .005, "free landmark did not optimize");
         std::printf("PASS %s fixed landmarks: %.9g -> %.9g\n", cpu ? "CPU" : real == RealCfg::F64 ? "Vulkan F64" : "Vulkan F32", stats.initial_cost, final);
+        auto one = fixture(); std::set<uint64_t> all_fixed;
+        for (auto& im : one.images) im.second.registered = im.first == 0;
+        for (auto& point : one.points3D) {
+            if (point.first >= 1090) point.second.xyz = point.second.xyz - Vec3{.03, -.02, .04};
+            auto& track = point.second.track;
+            track.erase(std::remove_if(track.begin(), track.end(), [](const auto& e) { return e.image_id != 0; }), track.end());
+            all_fixed.insert(point.first);
+        }
+        opt.fixed_points = &all_fixed;
+        auto single_layout = buildBundle(one, opt);
+        require(single_layout.P.num_images == 1 && single_layout.P.num_obs >= 4,
+            "single-camera pose refinement was silently skipped despite fixed geometry");
+        runGlobalBA(one, opt);
+        require(stats.initial_cost > 0 && stats.final_cost < stats.initial_cost * .02,
+            "single-camera fixed-geometry refinement did not reduce reprojection cost");
+        std::printf("PASS single camera %s: %.9g -> %.9g\n", cpu ? "CPU" : real == RealCfg::F64 ? "Vulkan F64" : "Vulkan F32",
+            stats.initial_cost, stats.final_cost);
     }
     return 0;
 }

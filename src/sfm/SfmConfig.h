@@ -87,6 +87,7 @@ struct SfmConfig {
     int block_neighbours = 40;
     double block_radius = 0;  // horizontal metres; 0 = nearest neighbours without a distance cap
     int block_cache_mb = 512;
+    std::string regional_work_dir;
     int regional_iterations = 8;
     double regional_cost_tolerance = 0.0001;
     int regional_landmarks = 100000;
@@ -350,6 +351,7 @@ struct SfmConfig {
       1000000, "", block_radius)                                                                  \
     F(block_cache_mb, "block-cache-mb", CMD_AUTO | CMD_MATCH | CMD_MAP, Tier::Advanced, "matching", 1,     \
       1048576, "", block_cache_mb)                                                                \
+    F(regional_work_dir, "regional-work-dir", CMD_AUTO | CMD_MAP, Tier::Advanced, "mapping", 0, 0, "", regional_work_dir) \
     F(regional_iterations, "regional-iterations", CMD_AUTO | CMD_MAP, Tier::Advanced, "mapping", 1, 100, "", regional_iterations) \
     F(regional_cost_tolerance, "regional-cost-tolerance", CMD_AUTO | CMD_MAP, Tier::Advanced, "mapping", 0, 1, "", regional_cost_tolerance) \
     F(regional_landmarks, "regional-landmarks", CMD_AUTO | CMD_MAP, Tier::Advanced, "mapping", 50, 1000000, "", regional_landmarks) \
@@ -665,9 +667,9 @@ struct SfmConfig {
     F(feature_dir, "features", CMD_MAP, Tier::Advanced, "input", 0, 0, "", feature_dir)            \
     F(resume, "resume", CMD_MAP, Tier::Advanced, "input", 0, 0, "", resume)                        \
     F(reuse, "resume", CMD_AUTO, Tier::Basic, "input", 0, 0, "", auto_resume)                      \
-    F(reuse_features, "reuse-features", CMD_AUTO, Tier::Advanced, "input", 0, 0, "auto|keep|redo", \
+    F(reuse_features, "reuse-features", CMD_AUTO, Tier::Advanced, "input", 0, 0, "auto|keep|redo|require", \
       reuse_features)                                                                              \
-    F(reuse_matches, "reuse-matches", CMD_AUTO, Tier::Advanced, "input", 0, 0, "auto|keep|redo",   \
+    F(reuse_matches, "reuse-matches", CMD_AUTO, Tier::Advanced, "input", 0, 0, "auto|keep|redo|require",   \
       reuse_matches)                                                                               \
     F(check, "check", CMD_MAP, Tier::Advanced, "input", 0, 0, "", check)                           \
     /* ---- runtime ---- */                                                                        \

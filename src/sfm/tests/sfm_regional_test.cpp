@@ -25,13 +25,14 @@ static int test(int, char**) {
     require(index.pairs[1].config == 3 && index.metadata.camera_ids == db.camera_ids && index.metadata.focal_measured == db.focal_measured, "indexed camera or pair metadata lost");
     std::vector<regional::Region> plan = regional::planRegions(index, {{0, 0, 0}, {1, 0, 0}, {0, 1, 0}, {1, 1, 0}}, 2);
     std::vector<uint32_t> owned;
-    for (const auto& r : plan) { owned.insert(owned.end(), r.core.begin(), r.core.end()); require(r.core.size() <= 2, "requested region size ignored"); }
+    for (const auto& r : plan) { owned.insert(owned.end(), r.core.begin(), r.core.end()); require(!r.core.empty(), "empty spatial region"); }
     std::sort(owned.begin(), owned.end()); require(owned == std::vector<uint32_t>({0, 1, 2, 3}), "regional ownership incomplete");
     MatchesIndex dense = index;
     for (auto& im : dense.images) im.num_features = 1000000;
     for (auto& pair : dense.pairs) pair.count = 1000000;
     auto custom = regional::planRegions(dense, {{0, 0, 0}, {1, 0, 0}, {0, 1, 0}, {1, 1, 0}}, 3);
-    require(custom.size() == 2 && custom[0].core.size() == 3, "custom core limit was preemptively reduced by density");
+    require(custom.size() == 2 && custom[0].core.size() + custom[1].core.size() == 4,
+            "target region count or unique input coverage changed with density");
     {
         MatchesIndex links = index;
         links.pairs = {{0, 1, 30, 0, 0}, {0, 2, 90, 0, 0}, {0, 3, 60, 0, 0}};
@@ -62,6 +63,10 @@ static int test(int, char**) {
     require(compact.images.count(1) && compact.images.count(2) && compact.points3D.at(1).track[0].point2D_idx == 2 &&
         compact.points3D.at(1).track[1].point2D_idx == 1 && compact.images.at(2).point3D_ids.at(1) == 1, "global feature restoration failed");
     {
+        require(regional::regionalWorkingCache(size_t(8) << 30) == size_t(1) << 30 &&
+            regional::regionalWorkingCache(size_t(32) << 30) == size_t(2) << 30 &&
+            regional::regionalWorkingCache(size_t(64) << 20) == size_t(8) << 20,
+            "regional working cache ignored the memory budget or its upper bound");
         regional::PointUnion points(root / "union.bin", sizeof(regional::PointNode) * 512);
         Point3D p; p.xyz = {1, 2, 3}; p.track = {{0, 0}, {1, 0}};
         for (size_t i = 0; i < 1700; ++i) points.add(p);
@@ -107,6 +112,15 @@ static int test(int, char**) {
     const auto& point = merged.points3D.begin()->second;
     for (const auto& e : point.track) require(merged.images.at(e.image_id).point3D_ids.at(e.point2D_idx) == merged.points3D.begin()->first, "COLMAP reciprocal track inconsistent");
     require(point.track.size() == 3 && stats.error < 1e-5, "duplicate boundary observation or wrong export pose");
+    require(stats.photo_components == 1 && stats.photos_without_points == 0 && stats.min_photo_observations == 1,
+        "export did not validate actual per-photo visual connectivity");
+    auto isolated_poses = poses; auto image = poses.images.at(0); image.id = 7;
+    image.name = poses.images.at(0).name; isolated_poses.images[7] = image;
+    auto isolated_stats = regional::exportUnified(blocks.size(), [&](size_t i) { return blocks[i]; }, isolated_poses,
+        [&](uint32_t i) { return root / "features" / (poses.images.at(i == 7 ? 0 : i).name + ".bin"); },
+        root / "isolated-export", root / "isolated-output", sizeof(regional::PointNode) * 512, 3);
+    require(isolated_stats.photo_components == 2 && isolated_stats.photos_without_points == 1 && isolated_stats.min_photo_observations == 0,
+        "a GPS-only isolated camera was hidden by regional connectivity");
     Vec3 displacement = point.xyz - xyz;
     require(displacement.x * displacement.x + displacement.y * displacement.y + displacement.z * displacement.z < 1e-10,
         "unified triangulation did not recover consistent geometry");

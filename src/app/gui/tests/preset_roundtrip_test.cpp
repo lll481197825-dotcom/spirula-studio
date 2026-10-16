@@ -135,6 +135,7 @@ static void test_dataset_preset() {
     s.sfm.block_neighbours = 63;
     s.sfm.block_radius = 123.5f;
     s.sfm.block_cache_mb = 129;
+    s.sfm.regional_work_dir = "work volume/regions";
     s.sfm.map_memory_mb = 4096;
     s.sfm.overlap = 25;
     s.sfm.loop_closure = false;
@@ -266,6 +267,7 @@ static void test_dataset_preset() {
     CHECK_EQ(b.sfm.block_neighbours, s.sfm.block_neighbours);
     CHECK_EQ(b.sfm.block_radius, s.sfm.block_radius);
     CHECK_EQ(b.sfm.block_cache_mb, s.sfm.block_cache_mb);
+    CHECK_EQ(b.sfm.regional_work_dir, s.sfm.regional_work_dir);
     CHECK_EQ(b.sfm.map_memory_mb, s.sfm.map_memory_mb);
     CHECK_EQ(b.sfm.overlap, s.sfm.overlap);
     CHECK_EQ(b.sfm.loop_closure, s.sfm.loop_closure);

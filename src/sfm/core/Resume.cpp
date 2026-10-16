@@ -1,6 +1,7 @@
 // Resume.cpp -- see Resume.h.
 
 #include "sfm/core/Resume.h"
+#include "sfm/core/DiskStorage.h"
 
 #include <chrono>
 #include <cstring>
@@ -42,7 +43,7 @@ bool check_signature(std::istream& f, const std::string& sig) {
     if (!read_u32(f, len) || len > (1u << 20)) return false;
     std::string seen(len, '\0');
     f.read(&seen[0], (std::streamsize)len);
-    return f.gcount() == (std::streamsize)len && seen == sig;
+    return f.gcount() == (std::streamsize)len && equivalentSignatures(seen, sig);
 }
 
 bool magic_is(std::istream& f, const char* want) {
@@ -55,6 +56,21 @@ bool magic_is(std::istream& f, const char* want) {
 
 fs::path dir(const std::string& workspace) { return fs::path(workspace) / kDir; }
 
+bool equivalentSignatures(const std::string& a, const std::string& b) {
+    auto normalize = [](const std::string& value) {
+        std::string result;
+        for (size_t begin = 0; begin < value.size();) {
+            size_t end = value.find('\n', begin); if (end == std::string::npos) end = value.size();
+            if (value.compare(begin, 15, "block-cache-mb=") != 0 &&
+                value.compare(begin, 15, "reuse-features=") != 0 && value.compare(begin, 14, "reuse-matches=") != 0)
+                result.append(value, begin, end - begin + (end < value.size()));
+            begin = end + 1;
+        }
+        return result;
+    };
+    return normalize(a) == normalize(b);
+}
+
 std::string recorded(const fs::path& file) {
     std::ifstream f(file, std::ios::binary);
     if (!f) return "";
@@ -63,10 +79,17 @@ std::string recorded(const fs::path& file) {
 }
 
 void store(const fs::path& file, const std::string& signature) {
-    std::error_code ec;
-    fs::create_directories(file.parent_path(), ec);
-    std::ofstream f(file, std::ios::binary | std::ios::trunc);
-    if (f) f << signature;
+    storage::requireSpace(file.parent_path(), signature.size());
+    fs::create_directories(file.parent_path());
+    fs::path tmp = file; tmp += ".part";
+    std::ofstream f(tmp, std::ios::binary | std::ios::trunc);
+    if (!f) throw std::runtime_error("cannot create resume checkpoint: " + tmp.u8string());
+    f.write(signature.data(), std::streamsize(signature.size()));
+    f.flush();
+    if (!f) throw std::runtime_error("cannot write resume checkpoint: " + tmp.u8string());
+    f.close();
+    if (!f) throw std::runtime_error("cannot close resume checkpoint: " + tmp.u8string());
+    storage::replaceFile(tmp, file);
 }
 
 void forget(const fs::path& file) {

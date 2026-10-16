@@ -2,7 +2,10 @@
 
 #include "sfm/map/RegionalStore.h"
 #include "sfm/ba/CpuParallel.h"
+#include "sfm/core/Resume.h"
+#include "sfm/core/Log.h"
 #include <array>
+#include <functional>
 #include <set>
 #include <sstream>
 
@@ -16,6 +19,28 @@ inline std::string regionalBaseSignature(const std::string& settings) {
         out += line + "\n";
     }
     return out;
+}
+
+inline fs::path compatibleRegionalRoot(const fs::path& preferred, const std::string& signature) {
+    auto score = [](const fs::path& root) {
+        std::pair<size_t, size_t> result{};
+        if (!fs::exists(root)) return result;
+        for (const auto& e : fs::directory_iterator(root)) if (e.path().extension() == ".done") {
+            auto name = e.path().filename().string();
+            result.first += name.rfind("pass-0-region-", 0) == 0;
+            result.second += name.rfind("local-region-", 0) == 0;
+        }
+        return result;
+    };
+    fs::path selected = preferred; auto best = score(selected);
+    if (!fs::exists(preferred.parent_path())) return selected;
+    for (const auto& e : fs::directory_iterator(preferred.parent_path())) {
+        if (!e.is_directory() || !fs::exists(e.path() / "signature.txt") ||
+            !resume::equivalentSignatures(resume::recorded(e.path() / "signature.txt"), signature)) continue;
+        auto current = score(e.path());
+        if (current > best) { selected = e.path(); best = current; }
+    }
+    return selected;
 }
 
 struct SharedMember { uint32_t model = 0; uint64_t point = 0; Vec3 xyz; };
@@ -63,12 +88,14 @@ inline uint64_t sharedHash(uint64_t x) {
 }
 
 template<class ReadModel> SharedIndex buildSharedIndex(size_t models, ReadModel read,
-    const fs::path& scratch, size_t cache, size_t memory_limit, size_t max_points = 100000) {
+    const fs::path& scratch, size_t cache, size_t memory_limit, size_t max_points = 100000,
+    std::function<Reconstruction(size_t)> read_views = {}) {
     fs::create_directories(scratch);
     std::map<uint32_t, uint32_t> uses;
     for (size_t m = 0; m < models; ++m) {
-        cancel::check(); auto rec = read(m);
+        cancel::check(); auto rec = read_views ? read_views(m) : read(m);
         for (const auto& im : rec.images) if (im.second.registered) ++uses[im.first];
+        slog::diag(slog::Tag::Map, "[regional] shared index camera scan %zu/%zu\n", m + 1, models);
     }
     struct Fragment { SharedMember member; uint64_t observations = 0; };
     SharedIndex result; result.models = models;
@@ -88,8 +115,11 @@ template<class ReadModel> SharedIndex buildSharedIndex(size_t models, ReadModel 
                 for (const auto& e : p.track) if (uses[e.image_id] > 1)
                     record(out, Observation{(uint64_t(e.image_id) << 32) | e.point2D_idx, id});
             }
+            slog::diag(slog::Tag::Map, "[regional] shared index boundary scan %zu/%zu, fragments %llu\n",
+                m + 1, models, (unsigned long long)fragments.size());
         }
     }
+    slog::diag(slog::Tag::Map, "[regional] sorting shared boundary observations, %.1f MiB\n", fs::file_size(records) / double(1u << 20));
     auto sorted = sortObservations(records, scratch / "by-feature", cache);
     {
         std::ifstream in(sorted, std::ios::binary); Observation row, previous; bool have = false;
@@ -313,33 +343,44 @@ inline double sharedCost(const SharedIndex& index, const Reconstruction& poses, 
     return sum;
 }
 
-inline void triangulateShared(SharedIndex& index, const Reconstruction& poses, double gate) {
-    std::vector<Observation> track;
-    for (auto& p : index.landmarks) if (p.valid) {
-        cancel::check(); track.clear();
-        for (const auto& obs : p.observations) track.push_back({0, obs.key, obs.xy});
-        Vec3 updated = refineUnifiedPoint(p.xyz, track, poses, gate);
-        if (!std::isfinite(updated.norm())) throw std::runtime_error("shared triangulation produced nonfinite coordinates");
-        p.xyz = updated;
-    }
+inline void triangulateShared(SharedIndex& index, const Reconstruction& poses, double gate, int threads = 0,
+                              const std::set<uint32_t>* changed_images = nullptr) {
+    auto& pool = bacpu::Pool::get(); const int workers = threads > 0 ? std::min(threads, pool.size()) : pool.size();
+    constexpr size_t grain = 64;
+    pool.runChecked(int((index.landmarks.size() + grain - 1) / grain), workers, [&](int task, int) {
+        std::vector<Observation> track; std::vector<PointView> views;
+        for (size_t k = size_t(task) * grain; k < std::min(index.landmarks.size(), (size_t(task) + 1) * grain); ++k) {
+            auto& p = index.landmarks[k]; if (!p.valid) continue;
+            if (changed_images && std::none_of(p.observations.begin(), p.observations.end(), [&](const SharedObservation& o) {
+                return changed_images->count(uint32_t(o.key >> 32)) != 0;
+            })) continue;
+            cancel::check(); track.clear();
+            for (const auto& obs : p.observations) track.push_back({0, obs.key, obs.xy});
+            Vec3 updated = refineUnifiedPoint(p.xyz, track, poses, gate, &views);
+            if (!std::isfinite(updated.norm())) throw std::runtime_error("shared triangulation produced nonfinite coordinates");
+            p.xyz = updated;
+        }
+    });
 }
 
-inline void triangulatePrivate(Reconstruction& rec, const std::set<uint64_t>& shared, double gate, int threads = 0) {
+inline void triangulatePrivate(Reconstruction& rec, const std::set<uint64_t>& shared, double gate, int threads = 0,
+                               const std::set<uint32_t>* changed_images = nullptr) {
     auto& pool = bacpu::Pool::get(); const int workers = threads > 0 ? std::min(threads, pool.size()) : pool.size();
-    std::vector<Point3D*> points; points.reserve(4096);
+    constexpr size_t batch = 65536, grain = 256;
+    std::vector<Point3D*> points; points.reserve(batch);
     const auto& poses = rec;
     auto refine = [&] {
-        const int tasks = int((points.size() + 63) / 64);
+        const int tasks = int((points.size() + grain - 1) / grain);
         pool.runChecked(tasks, workers, [&](int task, int) {
-            std::vector<Observation> track;
-            for (size_t k = size_t(task) * 64; k < std::min(points.size(), (size_t(task) + 1) * 64); ++k) {
+            std::vector<Observation> track; std::vector<PointView> views;
+            for (size_t k = size_t(task) * grain; k < std::min(points.size(), (size_t(task) + 1) * grain); ++k) {
                 cancel::check(); auto& point = *points[k]; track.clear();
                 for (const auto& e : point.track) {
                     const auto& im = poses.images.at(e.image_id);
                     if (!im.registered || e.point2D_idx >= im.points2D.size()) throw std::runtime_error("invalid private triangulation track");
                     track.push_back({0, (uint64_t(e.image_id) << 32) | e.point2D_idx, im.points2D[e.point2D_idx]});
                 }
-                Vec3 updated = refineUnifiedPoint(point.xyz, track, poses, gate);
+                Vec3 updated = refineUnifiedPoint(point.xyz, track, poses, gate, &views);
                 if (!std::isfinite(updated.norm())) throw std::runtime_error("private triangulation produced nonfinite coordinates");
                 point.xyz = updated;
             }
@@ -348,7 +389,9 @@ inline void triangulatePrivate(Reconstruction& rec, const std::set<uint64_t>& sh
     };
     for (auto& item : rec.points3D) {
         if (shared.count(item.first) || item.second.track.size() < 2) continue;
-        points.push_back(&item.second); if (points.size() == 4096) refine();
+        if (changed_images && std::none_of(item.second.track.begin(), item.second.track.end(),
+            [&](const auto& e) { return changed_images->count(e.image_id); })) continue;
+        points.push_back(&item.second); if (points.size() == batch) refine();
     }
     refine();
 }

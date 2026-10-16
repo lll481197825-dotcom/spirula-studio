@@ -338,10 +338,23 @@ void check_mapper_joint_rejection() {
     check(refused, "Mapper joint split refuses a tiny budget instead of skipping singletons");
 }
 
+void check_device_budget() {
+    Fixture f = fixture();
+    BundleOptions options; options.real = RealCfg::F64; options.solver = "cg";
+    options.device_budget_bytes = 32; options.over_budget_throws = true;
+    const auto before = f.rec.images.begin()->second.pose.t;
+    bool refused = false;
+    try { runGlobalBA(f.rec, options); }
+    catch (const BAOverBudget& e) { refused = e.need_mb > e.budget_mb; }
+    check(refused && (f.rec.images.begin()->second.pose.t - before).norm() == 0,
+          "tiny explicit device budget refuses before committing bundle parameters");
+}
+
 int cmdTest(int, char**) {
     check_layout(false);
     check_layout(true);
     check_cpu_solve();
+    check_device_budget();
     check_rejections();
     check_sparse_rig_rejection();
     check_empty_sparse_layout();

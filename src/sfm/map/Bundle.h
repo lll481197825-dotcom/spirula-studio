@@ -83,6 +83,7 @@ struct BundleOptions {
     // for a caller that can split the problem and retry (Mapper::jointRefine).
     bool over_budget_throws = false;
     size_t host_budget_bytes = 0;
+    size_t device_budget_bytes = 0;
     uint64_t index_limit = UINT32_MAX;
     // ... and only for camera groups with at least this many images behind
     // them. A group of one image has no sharing at all: moving its principal
@@ -288,11 +289,18 @@ inline size_t estimateJointBundleHostBytes(const std::vector<Reconstruction*>& m
     return bundle_detail::hostBytes(bytes);
 }
 
-// Pack `rec` into a BAProblem. Empty layout (num_images < 2) if there is
-// nothing to optimize.
+// Pack `rec` into a BAProblem, including a lone pose observing fixed geometry.
 inline BundleLayout buildBundle(Reconstruction& rec, const BundleOptions& bopt) {
-    if (rec.numRegistered() < 2 ||
-        std::none_of(rec.points3D.begin(), rec.points3D.end(),
+    if (rec.numRegistered() < 2) {
+        if (!rec.numRegistered() || bopt.refine_intrinsics || !bopt.fixed_points) return BundleLayout{};
+        size_t visible = 0;
+        for (const auto& p : rec.points3D) if (bopt.fixed_points->count(p.first) &&
+            std::any_of(p.second.track.begin(), p.second.track.end(), [&](const auto& e) {
+                return rec.images.at(e.image_id).registered;
+            })) ++visible;
+        if (visible < 4) return BundleLayout{};
+    }
+    if (std::none_of(rec.points3D.begin(), rec.points3D.end(),
                      [&](const auto& point) { return point.second.track.size() >= 2 ||
                          (bopt.fixed_points && bopt.fixed_points->count(point.first) && !point.second.track.empty()); }))
         return BundleLayout{};
@@ -335,7 +343,7 @@ inline BundleLayout buildBundle(Reconstruction& rec, const BundleOptions& bopt) 
         ptIds.push_back(kv.first);
         ptOf.push_back(&kv.second);
     }
-    if (imgIds.size() < 2 || ptIds.empty()) return BundleLayout{};
+    if (imgIds.empty() || ptIds.empty()) return BundleLayout{};
 
     // Camera groups: one per distinct camera used (usually a single shared one).
     std::vector<uint32_t>& camIds = L.camIds;
@@ -569,6 +577,7 @@ inline SolverOptions bundleSolverOptions(const BundleOptions& bopt) {
     else if (bopt.solver == "cg") sopt.solver = SolverSel::CG;
     sopt.over_budget_throws = bopt.over_budget_throws;
     sopt.host_budget_bytes = bopt.host_budget_bytes;
+    if (bopt.device_budget_bytes) sopt.vram_budget_mb = double(bopt.device_budget_bytes) / (1024 * 1024);
     sopt.threads = bopt.threads;
     return sopt;
 }
@@ -631,7 +640,7 @@ inline size_t bundleProblemHostBytes(const BAProblem& P) {
     };
     add(P.image_frame); add(P.image_member); add(P.members);
     add(P.obs_image); add(P.obs_point); add(P.obs_xy); add(P.obs_ranges);
-    add(P.image_group); add(P.groups); add(P.poses); add(P.exts); add(P.intr); add(P.points); add(P.fixed_points); add(P.fixed_frames);
+    add(P.image_group); add(P.groups); add(P.poses); add(P.exts); add(P.intr); add(P.points); add(P.fixed_points); add(P.fixed_frames); add(P.point_kinds);
     add(P.model_obs); add(P.model_ranges); add(P.jc_off);
     add(P.pair_entries); add(P.pair_chunks);
     add(P.cam_obs_ranges); add(P.cam_obs); add(P.cam_chunks); add(P.prec_blocks);
@@ -674,6 +683,9 @@ inline BundleRun solveBundle(BAProblem& P, SolverOptions sopt, VkContext* shared
         noteBaDeviceFailure(e, P.num_obs);
         if (released) {
             BAProblem fresh = rebuild();
+            if (fresh.num_points != P.num_points || fresh.point_kinds != P.point_kinds)
+                throw std::runtime_error("BA host fallback rebuilt different landmark kinds");
+            validateBAPointKinds(fresh);
             fresh.poses = std::move(P.poses);
             fresh.exts = std::move(P.exts);
             fresh.intr = std::move(P.intr);
@@ -709,7 +721,7 @@ inline double runGlobalBA(Reconstruction& rec, const BundleOptions& bopt) {
     BundleLayout L = buildBundle(rec, bopt);
     L.attachPriors();
     BAProblem& P = L.P;
-    if (P.num_images < 2) return 0;
+    if (!P.num_images) return 0;
     double t_build = prof_lap();
 
     const BundleRun run = solveBundle(P, bundleSolverOptions(bopt), bopt.shared_ctx,

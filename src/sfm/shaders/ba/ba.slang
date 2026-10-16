@@ -40,7 +40,7 @@ static const uint kNoMember = 0xFFFFFFFFu;
 [[vk::binding(5)]]  RWStructuredBuffer<Real> u_poses;      // (6 per frame)
 [[vk::binding(6)]]  RWStructuredBuffer<Real> u_intr;       // (flat intrinsics)
 [[vk::binding(7)]]  RWStructuredBuffer<Real> u_points;     // (3 per point)
-[[vk::binding(8)]]  StructuredBuffer<uint> u_obs_ranges;   // (num_points+1) obs sorted by point
+[[vk::binding(8)]]  StructuredBuffer<uint> u_obs_ranges;   // ranges, fixed-point/frame masks, then uint32 point kinds
 [[vk::binding(9)]]  StructuredBuffer<uint> u_model_obs;    // per-model obs index lists, concatenated
 [[vk::binding(10)]] StructuredBuffer<uint> u_jc_off;       // (per obs) element offset into u_Jc
 
@@ -196,18 +196,28 @@ void cost_impl<M : ICameraModel, let RIG : int>(uint tid, uint lid) {
         for (int i = 0; i < M.kNumIntr; i++) intr[i] = u_intr[gi.x + i];
         RVec3 X = rvec3(u_points[3 * pt + 0], u_points[3 * pt + 1], u_points[3 * pt + 2]);
         RVec2 obs = obsAt(o);
+        const bool direction = u3 != 0 && u_obs_ranges[u3 + pt] == 1;
 
         RVec2 r;
+        bool forward = true;
         if (RIG != 0) {
             uint4 mi = u_member_info[ii.y];
             Real ext[6];
             for (int i = 0; i < 6; i++) ext[i] = u_exts[mi.x + i];
-            r = reprojectRig<M>(pose, ext, intr, X, obs);
+            if (direction) {
+                RVec3 cameraDirection = rotateDirection(ext, rotateDirection(pose, X));
+                forward = directionForward<M>(cameraDirection, intr, obs);
+                r = projectResidual<M>(intr, cameraDirection, obs);
+            } else r = reprojectRig<M>(pose, ext, intr, X, obs);
         } else {
-            r = reproject<M>(pose, intr, X, obs);
+            if (direction) {
+                RVec3 cameraDirection = rotateDirection(pose, X);
+                forward = directionForward<M>(cameraDirection, intr, obs);
+                r = projectResidual<M>(intr, cameraDirection, obs);
+            } else r = reproject<M>(pose, intr, X, obs);
         }
         Real s = r.x * r.x + r.y * r.y;
-        c = Real(0.5) * Loss.cost(s, f0);
+        c = forward ? Real(0.5) * Loss.cost(s, f0) : Real(asfloat(0x7f800000u));
     }
     g_sh[lid] = c;
     GroupMemoryBarrierWithGroupSync();
@@ -247,6 +257,7 @@ void jac_impl<M : ICameraModel, let RIG : int>(uint tid) {
     for (int i = 0; i < M.kNumIntr; i++) intr[i] = u_intr[gi.x + i];
     RVec3 X = rvec3(u_points[3 * pt + 0], u_points[3 * pt + 1], u_points[3 * pt + 2]);
     RVec2 obs = obsAt(o);
+    const bool direction = u3 != 0 && u_obs_ranges[u3 + pt] == 1;
 
     // Evaluated over [frame 6 | member 6 if RIG | intrinsics kNumIntr]; stored
     // packed as [6 | mfree | gi.z], since a held parameter owns no column
@@ -267,9 +278,11 @@ void jac_impl<M : ICameraModel, let RIG : int>(uint tid) {
     Real Jp[2][3];
     RVec2 r;
     if (RIG != 0) {
-        r = reprojectRig<M>(pose, ext, intr, X, obs);
+        if (direction) r = reprojectRigDirection<M>(pose, ext, intr, X, obs);
+        else r = reprojectRig<M>(pose, ext, intr, X, obs);
     } else {
-        r = reproject<M>(pose, intr, X, obs);
+        if (direction) r = reprojectDirection<M>(pose, intr, X, obs);
+        else r = reproject<M>(pose, intr, X, obs);
     }
     Real s = r.x * r.x + r.y * r.y;
     Real sw = sqrt(Loss.weight(s, f0));
@@ -285,9 +298,11 @@ void jac_impl<M : ICameraModel, let RIG : int>(uint tid) {
             RVec2 seed = rvec2(row == 0 ? Real(1.0) : Real(0.0),
                                row == 0 ? Real(0.0) : Real(1.0));
             if (RIG != 0) {
-                bwd_diff(reprojectRig<M>)(dp_pose, dp_ext, dp_intr, dp_X, obs, seed);
+                if (direction) bwd_diff(reprojectRigDirection<M>)(dp_pose, dp_ext, dp_intr, dp_X, obs, seed);
+                else bwd_diff(reprojectRig<M>)(dp_pose, dp_ext, dp_intr, dp_X, obs, seed);
             } else {
-                bwd_diff(reproject<M>)(dp_pose, dp_intr, dp_X, obs, seed);
+                if (direction) bwd_diff(reprojectDirection<M>)(dp_pose, dp_intr, dp_X, obs, seed);
+                else bwd_diff(reproject<M>)(dp_pose, dp_intr, dp_X, obs, seed);
             }
             for (int i = 0; i < 6; i++) Jc[row][i] = jRound(dp_pose.d[i] * sw);
             if (RIG != 0)
@@ -300,9 +315,13 @@ void jac_impl<M : ICameraModel, let RIG : int>(uint tid) {
     }
     r.x = jRound(r.x * sw);
     r.y = jRound(r.y * sw);
+    if (direction) for (int row = 0; row < 2; ++row) {
+        for (int axis = 3; axis < 6; ++axis) Jc[row][axis] = Real(0.0);
+        if (RIG != 0) for (int axis = 9; axis < 12; ++axis) Jc[row][axis] = Real(0.0);
+    }
 
     // A zero point block removes it from Schur elimination while retaining camera factors.
-    if (u2 != 0 && u_obs_ranges[u2 + pt] != 0)
+    if (direction || (u2 != 0 && u_obs_ranges[u2 + pt] != 0))
         for (int row = 0; row < 2; row++)
             for (int j = 0; j < 3; j++) Jp[row][j] = Real(0.0);
 

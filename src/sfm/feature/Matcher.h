@@ -50,6 +50,7 @@ struct MatchOptions {
     // default holds ~1500 images; past that the block is recycled and images
     // are re-uploaded per batch, which is still far better than per pair.
     size_t descriptor_budget_bytes = 1536ull << 20;
+    uint32_t max_feature_count = 0;  // reserve for a lazily loaded, stable image table
 };
 
 struct IFeatureMatcher {
@@ -165,6 +166,9 @@ private:
         for (size_t k = begin; k < end; k++) {
             checkDescriptors(*feats[pairs[k].first]);
             checkDescriptors(*feats[pairs[k].second]);
+            if (opt_.max_feature_count && (feats[pairs[k].first]->count() > opt_.max_feature_count ||
+                                          feats[pairs[k].second]->count() > opt_.max_feature_count))
+                throw std::runtime_error("matcher image exceeds reserved feature count");
         }
         ensureSetup(feats);
         return true;
@@ -425,10 +429,11 @@ private:
     // pipelines are created against. Everything is sized once, from the whole
     // feature set, so nothing is reallocated underneath a live pipeline.
     void ensureSetup(const std::vector<const FeatureSet*>& feats) {
+        if (setup_ && opt_.max_feature_count) return;
         // Every image empty: nothing will be matched, but the buffers are still
         // sized and divided by, so pick the ordinary width.
         if (desc_words_ == 0) desc_words_ = 32;
-        uint64_t total = 0, maxCount = 0;
+        uint64_t total = 0, maxCount = opt_.max_feature_count;
         for (const FeatureSet* f : feats) {
             total += f->count();
             maxCount = std::max<uint64_t>(maxCount, f->count());

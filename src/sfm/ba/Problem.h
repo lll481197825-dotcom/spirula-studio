@@ -106,6 +106,15 @@ struct BAProblem {
     std::vector<double> points;  // 3 per point
     std::vector<uint32_t> fixed_points;
     std::vector<uint32_t> fixed_frames;
+    // Empty/0 is finite XYZ; 1 is a fixed unit world direction (homogeneous w=0).
+    std::vector<uint8_t> point_kinds;
+    bool directionalPoint(uint32_t point) const { return !point_kinds.empty() && point_kinds.at(point) == 1; }
+    uint32_t pointKindTableOffset() const {
+        if (point_kinds.empty()) return 0;
+        const uint64_t offset = uint64_t(num_points) + 1 + fixed_points.size() + fixed_frames.size();
+        if (offset + point_kinds.size() > UINT32_MAX) throw std::length_error("BA point-kind table exceeds native device indices");
+        return uint32_t(offset);
+    }
     bool frameFixed(uint32_t frame) const { return !fixed_frames.empty() && fixed_frames.at(frame) != 0; }
 
     // per-(model, rig) observation lists (concatenated) for specialized dispatches
@@ -171,6 +180,24 @@ struct BAProblem {
         ext_dim = 0;
     }
 };
+
+inline void validateBAPointKinds(const BAProblem& P) {
+    if (P.point_kinds.empty()) return;
+    if (P.point_kinds.size() != P.num_points || P.points.size() != 3ull * P.num_points)
+        throw std::runtime_error("BA point-kind/parameter layout mismatch");
+    (void)P.pointKindTableOffset();
+    for (uint32_t point = 0; point < P.num_points; ++point) {
+        const auto kind = P.point_kinds[point];
+        if (kind > 1) throw std::runtime_error("BA unknown landmark kind");
+        if (!kind) continue;
+        if (P.fixed_points.size() != P.num_points || P.fixed_points[point] != 1)
+            throw std::runtime_error("BA unit direction must be fixed; movable S2 landmarks are not implemented");
+        const double* value = &P.points[3ull * point];
+        const double norm2 = value[0] * value[0] + value[1] * value[1] + value[2] * value[2];
+        if (!std::isfinite(norm2) || std::fabs(norm2 - 1) > 1e-10)
+            throw std::runtime_error("BA direction is not a finite unit vector");
+    }
+}
 
 // No column of the reduced system owned by more than one image, which the
 // pair-Schur kernel requires. A group with no free parameters owns no column;
@@ -322,6 +349,7 @@ inline uint32_t imageColumns(const BAProblem& P, uint32_t img, uint32_t* cols) {
 
 // Build per-model obs lists and A_cp offsets from obs/image/group tables.
 inline void finalizeTables(BAProblem& P) {
+    validateBAPointKinds(P);
     if (!P.fixed_points.empty() && P.fixed_points.size() != P.num_points)
         throw std::runtime_error("BA fixed-point mask size mismatch");
     if (P.image_frame.size() != P.num_images) P.identityFrames();

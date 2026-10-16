@@ -6,10 +6,14 @@
 // code; the derivative is the same up to rounding.
 #pragma once
 
+#include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <limits>
 #include <stdexcept>
 #include <string>
+#include <type_traits>
+#include "sfm/core/Camera.h"
 
 namespace bacpu {
 
@@ -138,6 +142,7 @@ template <int N> inline Jet<N> atan2(const Jet<N>& y, const Jet<N>& x) {
 // ================
 
 struct SnavelyModel {
+    static constexpr int kDirectionForwardZ = -1;
     static constexpr int kNumIntr = 3;
     static constexpr bool kPeriodicX = false;
     template <class T> static void project(const T* c, const T p[3], T out[2]) {
@@ -155,6 +160,7 @@ struct SnavelyModel {
 };
 
 struct SnavelyFModel {
+    static constexpr int kDirectionForwardZ = -1;
     static constexpr int kNumIntr = 3;
     static constexpr bool kPeriodicX = false;
     template <class T> static void project(const T* c, const T p[3], T out[2]) {
@@ -171,6 +177,7 @@ struct SnavelyFModel {
 };
 
 struct PinholeRadialModel {
+    static constexpr int kDirectionForwardZ = 1;
     static constexpr int kNumIntr = 5;
     static constexpr bool kPeriodicX = false;
     template <class T> static void project(const T* c, const T p[3], T out[2]) {
@@ -189,6 +196,7 @@ struct PinholeRadialModel {
 };
 
 struct SimplePinholeModel {
+    static constexpr int kDirectionForwardZ = 1;
     static constexpr int kNumIntr = 3;
     static constexpr bool kPeriodicX = false;
     template <class T> static void project(const T* c, const T p[3], T out[2]) {
@@ -198,6 +206,7 @@ struct SimplePinholeModel {
 };
 
 struct PinholeModel {
+    static constexpr int kDirectionForwardZ = 1;
     static constexpr int kNumIntr = 4;
     static constexpr bool kPeriodicX = false;
     template <class T> static void project(const T* c, const T p[3], T out[2]) {
@@ -207,6 +216,7 @@ struct PinholeModel {
 };
 
 struct OpenCVModel {
+    static constexpr int kDirectionForwardZ = 1;
     static constexpr int kNumIntr = 8;
     static constexpr bool kPeriodicX = false;
     template <class T> static void project(const T* c, const T p[3], T out[2]) {
@@ -230,6 +240,7 @@ struct OpenCVModel {
 };
 
 struct FisheyeModel {
+    static constexpr int kDirectionForwardZ = 0;
     static constexpr int kNumIntr = 8;
     static constexpr bool kPeriodicX = false;
     template <class T> static void project(const T* c, const T p[3], T out[2]) {
@@ -252,6 +263,7 @@ struct FisheyeModel {
 };
 
 struct FullOpenCVModel {
+    static constexpr int kDirectionForwardZ = 1;
     static constexpr int kNumIntr = 12;
     static constexpr bool kPeriodicX = false;
     template <class T> static void project(const T* c, const T p[3], T out[2]) {
@@ -280,6 +292,7 @@ struct FullOpenCVModel {
 };
 
 struct ThinPrismFisheyeModel {
+    static constexpr int kDirectionForwardZ = 0;
     static constexpr int kNumIntr = 12;
     static constexpr bool kPeriodicX = false;
     template <class T> static void project(const T* c, const T p[3], T out[2]) {
@@ -310,6 +323,7 @@ struct ThinPrismFisheyeModel {
 };
 
 struct EquirectModel {
+    static constexpr int kDirectionForwardZ = 0;
     static constexpr int kNumIntr = 2;
     static constexpr bool kPeriodicX = true;
     template <class T> static void project(const T* c, const T p[3], T out[2]) {
@@ -419,12 +433,26 @@ inline void residualAt(const double* intr, const double p[3], const double obs[2
     r[1] = px[1] - obs[1];
 }
 
+template <class M> inline bool directionForward(const double p[3], const double* intr, const double obs[2]) {
+    if constexpr (M::kDirectionForwardZ != 0) return p[2] * M::kDirectionForwardZ >= 1e-8;
+    else {
+        sfm::Camera camera;
+        if constexpr (std::is_same_v<M, FisheyeModel>) camera.model = sfm::CamModel::OpenCVFisheye;
+        else if constexpr (std::is_same_v<M, ThinPrismFisheyeModel>) camera.model = sfm::CamModel::ThinPrismFisheye;
+        else camera.model = sfm::CamModel::Equirect;
+        sfm::unpackIntrinsics(camera, intr); const auto bearing = camera.bearing({obs[0], obs[1]});
+        const double dot = p[0] * bearing.x + p[1] * bearing.y + p[2] * bearing.z;
+        return std::isfinite(dot) && dot > 0;
+    }
+}
+
 template <class M>
 inline void residual(const double pose[6], const double* intr, const double X[3],
-                     const double obs[2], double r[2]) {
+                     const double obs[2], double r[2], bool direction = false) {
     double p[3];
     angleAxisRotate<double>(pose, X, p);
-    for (int i = 0; i < 3; i++) p[i] += pose[3 + i];
+    if (!direction) for (int i = 0; i < 3; i++) p[i] += pose[3 + i];
+    if (direction && !directionForward<M>(p, intr, obs)) { r[0] = r[1] = std::numeric_limits<double>::infinity(); return; }
     residualAt<M>(intr, p, obs, r);
 }
 
@@ -432,12 +460,13 @@ inline void residual(const double pose[6], const double* intr, const double X[3]
 // cam_from_rig (camera.slang reprojectRig).
 template <class M>
 inline void residualRig(const double pose[6], const double ext[6], const double* intr,
-                        const double X[3], const double obs[2], double r[2]) {
+                        const double X[3], const double obs[2], double r[2], bool direction = false) {
     double q[3], p[3];
     angleAxisRotate<double>(pose, X, q);
-    for (int i = 0; i < 3; i++) q[i] += pose[3 + i];
+    if (!direction) for (int i = 0; i < 3; i++) q[i] += pose[3 + i];
     angleAxisRotate<double>(ext, q, p);
-    for (int i = 0; i < 3; i++) p[i] += ext[3 + i];
+    if (!direction) for (int i = 0; i < 3; i++) p[i] += ext[3 + i];
+    if (direction && !directionForward<M>(p, intr, obs)) { r[0] = r[1] = std::numeric_limits<double>::infinity(); return; }
     residualAt<M>(intr, p, obs, r);
 }
 
@@ -498,13 +527,17 @@ inline void projectJacobian(const double* intr, const double p[3], const double 
 // Jc is [row][6 pose | kNumIntr intrinsics], Jp is [row][3].
 template <class M>
 inline void jacobian(const double pose[6], const double* intr, const double X[3],
-                     const double obs[2], double r[2], double* Jc, double* Jp) {
+                     const double obs[2], double r[2], double* Jc, double* Jp, bool direction = false) {
     constexpr int NI = M::kNumIntr;
     constexpr int DOF = 6 + NI;
     double Ja[9], R[9], p[3];
     angleAxisJacobian(pose, X, Ja, p);
     angleAxisMatrix(pose, R);
-    for (int i = 0; i < 3; i++) p[i] += pose[3 + i];
+    if (!direction) for (int i = 0; i < 3; i++) p[i] += pose[3 + i];
+    if (direction && !directionForward<M>(p, intr, obs)) {
+        r[0] = r[1] = std::numeric_limits<double>::infinity();
+        std::fill(Jc, Jc + 2 * DOF, 0); std::fill(Jp, Jp + 6, 0); return;
+    }
     double dp[2][3], di[2 * NI];
     projectJacobian<M>(intr, p, obs, r, dp, di);
     for (int row = 0; row < 2; row++) {
@@ -517,8 +550,8 @@ inline void jacobian(const double pose[6], const double* intr, const double X[3]
                 dx += dp[row][k] * R[3 * k + j];
             }
             jc[j] = da;
-            jc[3 + j] = dp[row][j];
-            jp[j] = dx;
+            jc[3 + j] = direction ? 0 : dp[row][j];
+            jp[j] = direction ? 0 : dx;
         }
         for (int i = 0; i < NI; i++) jc[6 + i] = di[row * NI + i];
     }
@@ -529,17 +562,21 @@ inline void jacobian(const double pose[6], const double* intr, const double X[3]
 template <class M>
 inline void jacobianRig(const double pose[6], const double ext[6], const double* intr,
                         const double X[3], const double obs[2], double r[2], double* Jc,
-                        double* Jp) {
+                        double* Jp, bool direction = false) {
     constexpr int NI = M::kNumIntr;
     constexpr int DOF = 12 + NI;
     double Jf[9], Rf[9], q[3];
     angleAxisJacobian(pose, X, Jf, q);
     angleAxisMatrix(pose, Rf);
-    for (int i = 0; i < 3; i++) q[i] += pose[3 + i];
+    if (!direction) for (int i = 0; i < 3; i++) q[i] += pose[3 + i];
     double Je[9], Re[9], p[3];
     angleAxisJacobian(ext, q, Je, p);
     angleAxisMatrix(ext, Re);
-    for (int i = 0; i < 3; i++) p[i] += ext[3 + i];
+    if (!direction) for (int i = 0; i < 3; i++) p[i] += ext[3 + i];
+    if (direction && !directionForward<M>(p, intr, obs)) {
+        r[0] = r[1] = std::numeric_limits<double>::infinity();
+        std::fill(Jc, Jc + 2 * DOF, 0); std::fill(Jp, Jp + 6, 0); return;
+    }
     double dp[2][3], di[2 * NI];
     projectJacobian<M>(intr, p, obs, r, dp, di);
     // dp_cam / d q = Re; dq / d frame_aa = Jf, dq / d frame_t = I, dq / dX = Rf
@@ -566,10 +603,10 @@ inline void jacobianRig(const double pose[6], const double ext[6], const double*
                 dx += dp[row][k] * ReRf[3 * k + j];
             }
             jc[j] = fa;
-            jc[3 + j] = ft;
+            jc[3 + j] = direction ? 0 : ft;
             jc[6 + j] = ea;
-            jc[9 + j] = dp[row][j];
-            jp[j] = dx;
+            jc[9 + j] = direction ? 0 : dp[row][j];
+            jp[j] = direction ? 0 : dx;
         }
         for (int i = 0; i < NI; i++) jc[12 + i] = di[row * NI + i];
     }

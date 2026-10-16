@@ -17,6 +17,7 @@
 #include <stdexcept>
 #include <string>
 #include <vector>
+#include <unordered_set>
 
 #include "sfm/core/Camera.h"
 #include "sfm/core/Spill.h"
@@ -286,10 +287,13 @@ struct MatchesIndex {
         uint32_t image1 = 0, image2 = 0, count = 0;
         uint64_t offset = 0;      // first idx1 of this pair's array
         int32_t config = 0;
+        uint32_t source = 0;
     };
     std::vector<ImageEntry> images;
     std::vector<Entry> pairs;
     MatchesDatabase metadata;
+    std::vector<std::string> sources;
+    std::unordered_set<uint64_t> attempted_pairs;
     bool complete = false;
 };
 
@@ -359,10 +363,7 @@ inline bool readPairMatches(std::istream& f,
     f.clear();
     f.seekg((std::streamoff)e.offset);
     out.resize(e.count);
-    for (uint32_t i = 0; i < e.count && f; i++) {
-        f.read((char*)&out[i].idx1, 4);
-        f.read((char*)&out[i].idx2, 4);
-    }
+    f.read(reinterpret_cast<char*>(out.data()), std::streamsize(e.count) * sizeof(FeatureMatch));
     if (!f) { out.clear(); return false; }
     return true;
 }

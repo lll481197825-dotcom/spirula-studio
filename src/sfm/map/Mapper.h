@@ -59,6 +59,7 @@
 #include "sfm/map/Merge.h"
 #include "sfm/map/Profile.h"
 #include "sfm/map/MemoryPolicy.h"
+#include "sfm/map/HeldRepairSeed.h"
 #include "core/Env.h"
 
 namespace sfm {
@@ -66,6 +67,7 @@ namespace sfm {
 struct MapperOptions {
     size_t graph_cache_bytes = 0;
     size_t host_budget_bytes = 0;
+    size_t device_budget_bytes = 0;
     uint64_t ba_index_limit = UINT32_MAX;
     std::string scratch_dir;
     bool sparse_image_features = false;
@@ -567,31 +569,21 @@ public:
         bool refined = false;      // whether a final refinement ran
     };
 
-    // Adopt `m` and keep registering into it until nothing else fits. An image
-    // another model holds is a legitimate target here -- the overlap it creates
-    // is what lets the two models merge afterwards (D43) -- bounded by
-    // `overlapBudget`, so the pass may keep taking them while it is still
-    // finding images of its own. Pass the other models in `others` to get that
-    // bound; with `others` empty the pass is unbounded, and on a fragmented
-    // capture that means every model re-registers the whole dataset before the
-    // redundant ones are dropped again, which is several full reconstructions'
-    // worth of work for nothing.
-    //
-    // A pass that registers nothing returns `m` untouched -- not a re-refined
-    // copy of it. That is what makes the manager's grow round free on a
-    // dataset it cannot help: no BA runs, no numbers move.
-    // `max_reg` caps the size the model may reach (0 = grow until nothing
-    // registers). The overlap bound above only limits images *another model*
-    // holds; images nothing covers are unbounded, so a model beside a large
-    // uncovered region grows into all of it. That is a full reconstruction, and
-    // a caller that wanted a bridge rather than a reconstruction needs to say
-    // so.
+    // Grow within the overlap and size bounds; a held seed keeps all original geometry.
+    // No new registration returns the input unchanged.
     Reconstruction continueFrom(const Reconstruction& m, GrowStats* out = nullptr,
                                 const std::vector<const Reconstruction*>& others = {},
-                                uint32_t max_reg = 0) {
+                                uint32_t max_reg = 0, bool hold_seed = false) {
         ensureSetup();
         resetModel();
-        adopt(m);
+        struct HeldScope {
+            std::set<uint32_t>& ids; std::unique_ptr<HeldRepairSeedContract>& contract;
+            ~HeldScope() { ids.clear(); contract.reset(); }
+        } held_scope{held_repair_images_,held_repair_seed_};
+        if (hold_seed) held_repair_seed_ = std::make_unique<HeldRepairSeedContract>(m);
+        adopt(m,hold_seed);
+        if (hold_seed) for (const auto& kv : m.images) if (kv.second.registered) held_repair_images_.insert(kv.first);
+        requireHeldRepairSeed("mapper.adopt");
         fitGpsFrame();
         model_count_.clear();
         for (const Reconstruction* o : others)
@@ -601,10 +593,12 @@ public:
         st.before = rec_.numRegistered();
         st.registered = growLoop(max_reg);
         st.after = rec_.numRegistered();
+        requireHeldRepairSeed("mapper.grow");
         if (out) *out = st;
         if (!st.registered) return m;
         st.refined = true;
         checkedRefine(true);
+        requireHeldRepairSeed("mapper.final");
         if (out) {
             out->refined = true;
             out->after = rec_.numRegistered();
@@ -1783,6 +1777,7 @@ public:
         if (live < 2) return;
         BundleOptions bo;
         bo.host_budget_bytes = availableBundleBudget(opt_.host_budget_bytes);
+        bo.device_budget_bytes = opt_.device_budget_bytes;
         bo.index_limit = opt_.ba_index_limit;
         bo.real = baReal(coarse);
         bo.device = opt_.device;
@@ -2234,14 +2229,14 @@ public:
         if (measured) *measured = true;
         const double gate = gps_frame_.gate;
         prior_stats_.gps_gate = gate;
-        if (d > kGpsRefuseGates * gate && gps_out_run_ == 0) {
+        if (d > (held_repair_images_.empty() ? kGpsRefuseGates * gate : 5.) && gps_out_run_ == 0) {
             reg_fail_.gps_far++;
             prior_stats_.gps_refused++;
             gps_refused_imgs_[img]++;
             if (opt_.verbose)
                 slog::diag(slog::Tag::Map, "[prior] GPS: %s refused, %.1f m off the fit",
                            db_.images[img].name.c_str(), d);
-            latchGps();
+            if (held_repair_images_.empty()) latchGps();
             return false;
         }
         gps_refused_imgs_.erase(img);
@@ -2587,6 +2582,9 @@ private:
                 if (fm.idx1 >= ia.point3D_ids.size() || fm.idx2 >= ib.point3D_ids.size()) continue;
                 const uint64_t keep = ia.point3D_ids[fm.idx1], gone = ib.point3D_ids[fm.idx2];
                 if (keep == kInvalidPoint3D || gone == kInvalidPoint3D || keep == gone) continue;
+                // Seam welding deliberately bypasses geometric validation. A held
+                // landmark may only receive individually checked observations.
+                if (held_repair_seed_ && (held_repair_seed_->contains(keep) || held_repair_seed_->contains(gone))) continue;
                 auto ik = rec_.points3D.find(keep), ig = rec_.points3D.find(gone);
                 if (ik == rec_.points3D.end() || ig == rec_.points3D.end()) continue;
                 Point3D& P = ik->second;
@@ -2634,7 +2632,7 @@ private:
     // Load an existing model into `rec_`: its poses, its cameras (whose focals
     // are then facts, not guesses), and its points re-added as fresh tracks.
     // Images the model does not hold keep the cleared state resetModel() left.
-    void adopt(const Reconstruction& m) {
+    void adopt(const Reconstruction& m, bool preserve_point_ids = false) {
         size_t missing = 0, name_mismatch = 0, count_mismatch = 0;
         if (rigs_) {
             rec_.rigs = m.rigs;
@@ -2689,7 +2687,7 @@ private:
             it->second.registered = true;
         }
         rec_.points3D.clear();
-        rec_.next_point3D_id = 1;
+        rec_.next_point3D_id = preserve_point_ids ? m.next_point3D_id : 1;
         for (const auto& kv : m.points3D) {
             std::vector<TrackElement> tr;
             for (const TrackElement& e : kv.second.track) {
@@ -2700,12 +2698,21 @@ private:
                 if (it->second.point3D_ids[e.point2D_idx] != kInvalidPoint3D) continue;
                 tr.push_back(e);
             }
-            if (tr.size() >= 2) {
-                uint64_t id = rec_.addPoint3D(kv.second.xyz, tr);
+            if (tr.size() >= 2 || (preserve_point_ids && !tr.empty())) {
+                uint64_t id;
+                if (preserve_point_ids) {
+                    if (tr.size() != kv.second.track.size() || kv.first >= rec_.next_point3D_id)
+                        throw std::runtime_error("held repair adoption lost a seed raw association");
+                    auto point = kv.second; point.track = tr;
+                    if (!rec_.points3D.emplace(kv.first,std::move(point)).second)
+                        throw std::runtime_error("held repair adoption duplicated a seed point ID");
+                    id = kv.first;
+                    for (const auto& row : tr) rec_.images.at(row.image_id).point3D_ids.at(row.point2D_idx) = id;
+                } else id = rec_.addPoint3D(kv.second.xyz, tr);
                 rec_.points3D[id].rgb[0] = kv.second.rgb[0];
                 rec_.points3D[id].rgb[1] = kv.second.rgb[1];
                 rec_.points3D[id].rgb[2] = kv.second.rgb[2];
-            }
+            } else if (preserve_point_ids) throw std::runtime_error("held repair adoption removed a seed point");
         }
         if (name_mismatch)
             slog::diag(slog::Tag::Map,
@@ -2797,7 +2804,7 @@ private:
         }
         g_map_prof.report(std::chrono::duration<double>(
                               std::chrono::steady_clock::now() - prof_start).count());
-        return models;
+        return std::move(models);
     }
 
 private:
@@ -3089,6 +3096,7 @@ private:
     // small model until the filters shred it. If refinement collapses the model,
     // restore the snapshot and de-register the images added since the last one.
     void checkedRefine(bool final_pass) {
+        requireHeldRepairSeed();
         uint32_t reg_before = rec_.numRegistered();
         Snapshot snap;
         {
@@ -3096,6 +3104,7 @@ private:
             snap = takeSnapshot();
         }
         globalRefine(final_pass);
+        requireHeldRepairSeed();
         // Collapse = losing half the registered images. Observation loss alone
         // is NOT a collapse: shredding most of a junk-heavy image's points
         // while every pose survives is the filters working as intended, and
@@ -3113,6 +3122,7 @@ private:
         }
         recent_regs_.clear();
         bssAfterBa();
+        requireHeldRepairSeed();
     }
 
     // ---- helpers ----
@@ -4290,16 +4300,22 @@ private:
         }
     }
 
-    // `r` comes in as the whole pool's pose and leaves as the winner against
-    // the one the near correspondences (`nearf`) support on their own, judged
-    // by near inliers first (D79). True when it changed.
+    PnPResult metricPnP(uint32_t img, const std::vector<Vec3>& points, const std::vector<Vec3>& bearings,
+                        double focal, double error, int trials = 3000) {
+        std::function<bool(const Pose&)> eligible;
+        if (!held_repair_images_.empty() && priors_ && gps_frame_.ok) eligible = [&](const Pose& pose) {
+            double distance; return priors_->positionError(img, pose, gps_frame_, distance) && distance <= 5.;
+        };
+        return ransacPnP(points, bearings, focal, error, 0, trials, eligible);
+    }
+    // Prefer the near-correspondence pose when it explains more near inliers (D79).
     bool preferNearPose(uint32_t img, const std::vector<Vec3>& X, const std::vector<Vec3>& br,
                         const std::vector<char>& nearf, PnPResult& r) {
         std::vector<Vec3> Xn, bn;
         for (size_t k = 0; k < X.size(); k++)
             if (nearf[k]) { Xn.push_back(X[k]); bn.push_back(br[k]); }
         if ((int)Xn.size() < opt_.min_num_pnp_inliers) return false;
-        PnPResult n = ransacPnP(Xn, bn, camOf(img).focal(), errPx(img));
+        PnPResult n = metricPnP(img, Xn, bn, camOf(img).focal(), errPx(img));
         if (!n.success || n.num_inliers < opt_.min_num_pnp_inliers) return false;
         int r_near = 0;
         if (r.success)
@@ -4433,7 +4449,7 @@ private:
         // joint refinement (D45), so the sweep stays.
         PnPResult rival;  // the whole pool's answer, when the neighbours overruled it
         if (focal_known_.count(cid) || opt_.focal_search_samples <= 0) {
-            r = ransacPnP(X, br, camOf(img).focal(), errPx(img));
+            r = metricPnP(img, X, br, camOf(img).focal(), errPx(img));
             if (seq_) {
                 const PnPResult whole = r;
                 if (preferNearPose(img, X, br, nearf, r)) rival = whole;
@@ -4454,7 +4470,7 @@ private:
                 trial.k1 = trial.k2 = trial.p1 = trial.p2 = 0;
                 std::vector<Vec3> bt(feat.size());
                 for (size_t k = 0; k < feat.size(); k++) bt[k] = trial.bearing(kp(img, feat[k]));
-                PnPResult t_r = ransacPnP(X, bt, trial.focal(), errPx(img));
+                PnPResult t_r = metricPnP(img, X, bt, trial.focal(), errPx(img));
                 if (t_r.success && t_r.num_inliers > r.num_inliers) { r = t_r; swept_f = trial.focal(); }
             }
         }
@@ -5340,7 +5356,12 @@ private:
             }
             size_t before = countObservations();
             BundleOptions bo;
+            if (!held_repair_images_.empty()) {
+                bo.fixed_images = &held_repair_images_; bo.refine_intrinsics = false; bo.refine_rigs = false;
+                bo.fixed_points = &held_repair_seed_->points();
+            }
             bo.host_budget_bytes = availableBundleBudget(opt_.host_budget_bytes);
+            bo.device_budget_bytes = opt_.device_budget_bytes;
             bo.index_limit = opt_.ba_index_limit;
             bo.real = realCfgFromName(opt_.ba_real);
             bo.device = opt_.device;
@@ -5378,10 +5399,10 @@ private:
             bo.solver = opt_.ba_solver;
             bo.real = baReal(loose);
             bo.shared_ctx = &baContext(loose);
-            bo.over_budget_throws = ba_over_budget_throws_;
+            bo.over_budget_throws = ba_over_budget_throws_ || opt_.device_budget_bytes != 0;
             bo.rigs = rigs_;
             bo.use_rigs = !final_.no_rig;
-            bo.refine_rigs = opt_.refine_rigs && rigRefineDue(tight && i == 0);
+            bo.refine_rigs = held_repair_images_.empty() && opt_.refine_rigs && rigRefineDue(tight && i == 0);
             if (rigs_ && !final_.no_rig) calibrateRigs(rec_);
             PosePriors pf;
             if (priors_) {
@@ -5410,7 +5431,7 @@ private:
             // internet image collections; on the only such collection here
             // (1363 images, one camera each) it is the other way round --
             // AUC@10 83.2 with, 68.7 without.
-            if (!final_.no_sanitize) sanitizeCameras();
+            if (!final_.no_sanitize && held_repair_images_.empty()) sanitizeCameras();
             int removedObs = 0, removedPts = 0;
             filterPoints(removedObs, removedPts, weld_round ? &welded : nullptr);
             if (opt_.verbose) {
@@ -5503,6 +5524,12 @@ private:
                 auto qit = rec_.points3D.find(qid);
                 if (qit == rec_.points3D.end()) continue;
                 Point3D& q = qit->second;
+                const bool fixed_p = held_repair_seed_ && held_repair_seed_->contains(pid);
+                const bool fixed_q = held_repair_seed_ && held_repair_seed_->contains(qid);
+                if (fixed_p && fixed_q) continue;
+                Point3D* keep = fixed_q ? &q : &pt;
+                Point3D* gone = fixed_q ? &pt : &q;
+                const uint64_t keep_id = fixed_q ? qid : pid, gone_id = fixed_q ? pid : qid;
 
                 // The reduced camera system the solver builds has an entry per
                 // image *pair* on a track, so a track of length t costs
@@ -5512,19 +5539,20 @@ private:
                 // 1194-image fisheye capture, unbounded fusion took the mean
                 // track from 3.5 to 7.2 observations and the bundle adjustment
                 // from 0.03 to 0.36 seconds per iteration.
-                if (pt.track.size() + q.track.size() > kMergeMaxTrack) continue;
+                if (keep->track.size() + gone->track.size() > kMergeMaxTrack) continue;
                 // One observation per image, or the union is not a track.
                 bool clash = false;
-                for (const TrackElement& a : pt.track) on_track[a.image_id] = 1;
-                for (const TrackElement& b : q.track)
+                for (const TrackElement& a : keep->track) on_track[a.image_id] = 1;
+                for (const TrackElement& b : gone->track)
                     if (on_track[b.image_id]) { clash = true; break; }
-                for (const TrackElement& a : pt.track) on_track[a.image_id] = 0;
+                for (const TrackElement& a : keep->track) on_track[a.image_id] = 0;
                 if (clash) continue;
 
-                const double wa = (double)pt.track.size(), wb = (double)q.track.size();
-                const Vec3 x = (pt.xyz * wa + q.xyz * wb) * (1.0 / (wa + wb));
+                const double wa = (double)keep->track.size(), wb = (double)gone->track.size();
+                const Vec3 x = fixed_p || fixed_q ? keep->xyz :
+                    (keep->xyz * wa + gone->xyz * wb) * (1.0 / (wa + wb));
                 bool ok = true;
-                for (const std::vector<TrackElement>* tr : {&pt.track, &q.track}) {
+                for (const std::vector<TrackElement>* tr : {&keep->track, &gone->track}) {
                     for (const TrackElement& el : *tr)
                         if (reprojErrAt(mi, el.image_id, el.point2D_idx, x) >
                             err * mi.pixel_scale[el.image_id]) { ok = false; break; }
@@ -5538,15 +5566,15 @@ private:
                 // halves are then retriangulated and merged again on the next
                 // round: churn that costs a bundle adjustment each time and
                 // ends where it started.
-                if (!wellTriangulated(pt.track, q.track, x, centers)) continue;
+                if (!wellTriangulated(keep->track, gone->track, x, centers)) continue;
 
-                const size_t absorbed = q.track.size();
-                pt.xyz = x;
-                for (const TrackElement& el : q.track) {
-                    mi.img[el.image_id]->point3D_ids[el.point2D_idx] = pid;
-                    pt.track.push_back(el);
+                const size_t absorbed = gone->track.size();
+                if (!fixed_p && !fixed_q) keep->xyz = x;
+                for (const TrackElement& el : gone->track) {
+                    mi.img[el.image_id]->point3D_ids[el.point2D_idx] = keep_id;
+                    keep->track.push_back(el);
                 }
-                rec_.points3D.erase(qit);
+                rec_.points3D.erase(gone_id);
                 return absorbed;
             }
         }
@@ -5737,10 +5765,12 @@ private:
                 for (size_t pi = b; pi < e; pi++) {
                     if (spare && spare->count(pts[pi].first)) continue;
                     Point3D& pt = *pts[pi].second;
+                    const bool fixed = held_repair_seed_ && held_repair_seed_->contains(pts[pi].first);
                     size_t keep = 0;  // compact in place; surviving order unchanged
                     for (size_t r = 0; r < pt.track.size(); r++) {
                         const TrackElement el = pt.track[r];
-                        if (reprojErrAt(mi, el.image_id, el.point2D_idx, pt.xyz) <=
+                        if ((fixed && held_repair_seed_->originalObservation(pts[pi].first,el)) ||
+                            reprojErrAt(mi, el.image_id, el.point2D_idx, pt.xyz) <=
                             opt_.max_reproj_error * mi.pixel_scale[el.image_id]) {
                             pt.track[keep++] = el;
                         } else {
@@ -5749,8 +5779,8 @@ private:
                         }
                     }
                     pt.track.resize(keep);
-                    bool degenerate = pt.track.size() < 2;
-                    if (!degenerate) {
+                    bool degenerate = !fixed && pt.track.size() < 2;
+                    if (!fixed && !degenerate) {
                         double best = 0;
                         for (size_t i = 0; i + 1 < pt.track.size() && best < min_ang; i++)
                             for (size_t j = i + 1; j < pt.track.size() && best < min_ang; j++)
@@ -5790,6 +5820,7 @@ private:
     // so the image can be retried until its budget runs out (D15's ranking
     // naturally re-offers it once more of the scene exists).
     void deregisterImage(uint32_t img) {
+        if (held_repair_images_.count(img)) return;
         Image& im = rec_.images[img];
         for (uint32_t f = 0; f < (uint32_t)im.point3D_ids.size(); f++) {
             uint64_t id = im.point3D_ids[f];
@@ -5801,7 +5832,7 @@ private:
             tr.erase(std::remove_if(tr.begin(), tr.end(),
                                     [&](const TrackElement& e) { return e.image_id == img; }),
                      tr.end());
-            if (tr.size() < 2) {
+            if (tr.size() < 2 && !(held_repair_seed_ && held_repair_seed_->contains(id))) {
                 for (const TrackElement& e : tr)
                     rec_.images[e.image_id].point3D_ids[e.point2D_idx] = kInvalidPoint3D;
                 rec_.points3D.erase(it);
@@ -5853,7 +5884,7 @@ private:
         std::vector<uint32_t> drop;
         std::set<uint32_t> seen;
         for (auto& kv : rec_.images) {
-            if (!kv.second.registered || seen.count(kv.first)) continue;
+            if (!kv.second.registered || seen.count(kv.first) || held_repair_images_.count(kv.first)) continue;
             const std::vector<uint32_t> frame = frameMates(kv.first);
             size_t points = 0;
             for (uint32_t j : frame) {
@@ -6121,6 +6152,11 @@ private:
     bool ba_requested_ = false;
     std::unordered_set<uint64_t> welded_;  // fused by fuseSeams; the next globalRefine spares them
     int refine_rounds_ = 0;                // BA rounds the last globalRefine ran
+    std::set<uint32_t> held_repair_images_;
+    std::unique_ptr<HeldRepairSeedContract> held_repair_seed_;
+    void requireHeldRepairSeed(const char* stage = "mapper.internal") const {
+        if (held_repair_seed_) held_repair_seed_->requireUnchanged(rec_,stage);
+    }
     // Counted from const passes that fan out over threads (the audit, the
     // seed prefetch).
     mutable std::atomic<uint32_t> prior_vouched_{0}, prior_seeds_{0};

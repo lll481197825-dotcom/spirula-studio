@@ -43,6 +43,27 @@ static void testSignatures(int& fails) {
 
     const std::string ext0 = stageSignature(base, CMD_EXTRACT);
     const std::string mat0 = stageSignature(base, CMD_MATCH);
+    {
+        auto required = base;
+        required.reuse_features = required.reuse_matches = "require";
+        check(stageSignature(required, CMD_AUTO) == stageSignature(base, CMD_AUTO),
+            "required reuse does not invalidate geometry identity", fails);
+        check(resume::equivalentSignatures("features=same\nreuse-features=auto\nreuse-matches=auto\n",
+                "features=same\nreuse-features=require\nreuse-matches=require\n"),
+            "legacy reuse policies remain compatible without changing feature identity", fails);
+        check(!resume::equivalentSignatures("features=before\nreuse-matches=auto\n", "features=after\nreuse-matches=require\n"),
+            "required reuse cannot accept changed features", fails);
+    }
+    {
+        auto c = base; c.block_cache_mb = base.block_cache_mb + 151;
+        check(stageSignature(c, CMD_MATCH) == mat0, "cache capacity does not invalidate completed matches", fails);
+        check(resume::equivalentSignatures(mat0 + "block-cache-mb=3000\n", mat0 + "block-cache-mb=2849\n"),
+            "legacy cache capacities remain compatible", fails);
+        check(!resume::equivalentSignatures(mat0 + "block-size=4000\n", mat0 + "block-size=6000\n"),
+            "changed photo partition must invalidate matching", fails);
+        check(!resume::equivalentSignatures(mat0 + "features=abcd\n", mat0 + "features=abce\n"),
+            "feature identity changes must invalidate matching", fails);
+    }
 
     // A flag the stage reads moves its signature.
     {

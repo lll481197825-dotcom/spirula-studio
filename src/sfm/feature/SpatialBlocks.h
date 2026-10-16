@@ -63,6 +63,16 @@ public:
         return out;
     }
 
+    std::vector<uint32_t> nearest(const Vec3& position, size_t count) const {
+        if (!count) return {};
+        if (!std::isfinite(position.x) || !std::isfinite(position.y)) throw std::invalid_argument("invalid recovery GPS query");
+        Heap heap; query({position.x, position.y, UINT32_MAX}, 0, points_.size(), 0, count,
+            std::numeric_limits<double>::infinity(), heap);
+        std::vector<uint32_t> ids;
+        while (!heap.empty()) { ids.push_back(heap.top().second); heap.pop(); }
+        std::reverse(ids.begin(), ids.end()); return ids;
+    }
+
 private:
     struct Point { double x, y; uint32_t id; };
     using Heap = std::priority_queue<std::pair<double, uint32_t>>;

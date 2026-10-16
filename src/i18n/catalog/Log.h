@@ -1310,29 +1310,34 @@ SS_MSG(sfm_not_metric,
        "yazılıyor."));
 
 SS_MSG(sfm_partial,
-    EN("Note: only part of the capture reconstructed. It will still train, but "
-       "expect gaps."),
-    JA("メモ: 撮影の一部しか復元できませんでした。学習はできますが、"
-       "欠けが出ます。"),
-    ZH_HANS("提示：只重建出了拍摄内容的一部分。仍然可以训练，但会有缺口。"),
-    ZH_HANT("提示：只重建出了拍攝內容的一部分。仍然可以訓練，但會有缺口。"),
-    KO("참고: 촬영분의 일부만 복원되었습니다. 학습은 되지만 빈 곳이 생깁니다."),
-    DE("Hinweis: Nur ein Teil der Aufnahme wurde rekonstruiert. Das Training "
-       "läuft trotzdem, aber mit Lücken."),
-    FR("Note : seule une partie de la prise de vue a été reconstruite. "
-       "L'entraînement fonctionnera, mais avec des trous."),
-    ES("Nota: solo se reconstruyó parte de la captura. Se puede entrenar igual, "
-       "pero habrá huecos."),
-    PT("Nota: só parte da captura foi reconstruída. Ainda dá para treinar, mas "
-       "haverá lacunas."),
-    IT("Nota: è stata ricostruita solo una parte della ripresa. Si può "
-       "addestrare lo stesso, ma con dei buchi."),
-    NL("Let op: slechts een deel van de opname is gereconstrueerd. Trainen kan "
-       "nog steeds, maar met gaten."),
-    RU("Примечание: восстановлена лишь часть съёмки. Обучение пойдёт, но с "
-       "пробелами."),
-    TR("Not: çekimin yalnızca bir bölümü yeniden kuruldu. Yine de eğitilebilir, "
-       "ama boşluklar olacak."));
+    EN("The reconstruction has not passed every acceptance check. The existing model can be viewed; see the log or acceptance report for the reasons."),
+    JA("再構成はすべての受け入れ検査に合格していません。既存のモデルは表示できます。理由はログまたは検査レポートを確認してください。"),
+    ZH_HANS("重建尚未通过全部验收。现有模型可以查看；具体原因见日志或验收报告。"),
+    ZH_HANT("重建尚未通過全部驗收。現有模型可以檢視；具體原因見日誌或驗收報告。"),
+    KO("재구성이 모든 검증을 통과하지 못했습니다. 기존 모델은 볼 수 있습니다. 이유는 로그 또는 검증 보고서를 확인하세요."),
+    DE("Die Rekonstruktion hat noch nicht alle Prüfungen bestanden. Das vorhandene Modell kann angezeigt werden; die Gründe stehen im Protokoll oder Prüfbericht."),
+    FR("La reconstruction n'a pas passé tous les contrôles. Le modèle existant peut être affiché ; consultez le journal ou le rapport de validation pour connaître les raisons."),
+    ES("La reconstrucción no ha superado todas las comprobaciones. Puede ver el modelo existente; consulte el registro o el informe de validación para conocer los motivos."),
+    PT("A reconstrução ainda não passou em todas as verificações. O modelo existente pode ser visualizado; consulte o registo ou o relatório de validação para saber os motivos."),
+    IT("La ricostruzione non ha superato tutte le verifiche. Il modello esistente è visualizzabile; i motivi sono nel registro o nel rapporto di verifica."),
+    NL("De reconstructie heeft nog niet alle controles doorstaan. Het bestaande model kan worden bekeken; de redenen staan in het logboek of validatierapport."),
+    RU("Реконструкция ещё не прошла все проверки. Имеющуюся модель можно просмотреть; причины указаны в журнале или отчёте о проверке."),
+    TR("Yeniden oluşturma tüm kabul kontrollerini henüz geçmedi. Mevcut model görüntülenebilir; nedenler için günlüğe veya kabul raporuna bakın."));
+
+SS_MSG(sfm_dense_deferred,
+    EN("Dense reconstruction is enabled but deferred until SfM passes every acceptance check. The option remains enabled; the existing model can be viewed."),
+    JA("密な再構成は有効ですが、SfMのすべての受け入れ検査に合格するまで保留します。設定は有効のままです。既存のモデルは表示できます。"),
+    ZH_HANS("稠密重建已启用，等待空三通过全部验收后再执行。选项保持启用；现有模型可以查看。"),
+    ZH_HANT("稠密重建已啟用，等待空三通過全部驗收後再執行。選項保持啟用；現有模型可以檢視。"),
+    KO("밀집 재구성은 활성화되어 있지만 SfM이 모든 검증을 통과할 때까지 보류됩니다. 설정은 유지되며 기존 모델은 볼 수 있습니다."),
+    DE("Die dichte Rekonstruktion ist aktiviert, wartet aber, bis SfM alle Prüfungen besteht. Die Option bleibt aktiviert; das vorhandene Modell kann angezeigt werden."),
+    FR("La reconstruction dense est activée, mais attend que SfM passe tous les contrôles. L'option reste activée ; le modèle existant peut être affiché."),
+    ES("La reconstrucción densa está activada, pero espera a que SfM supere todas las comprobaciones. La opción sigue activada y puede ver el modelo existente."),
+    PT("A reconstrução densa está ativada, mas aguarda que o SfM passe em todas as verificações. A opção mantém-se ativa e o modelo existente pode ser visualizado."),
+    IT("La ricostruzione densa è attiva, ma attende che SfM superi tutte le verifiche. L'opzione resta attiva e il modello esistente è visualizzabile."),
+    NL("Dichte reconstructie is ingeschakeld maar wacht tot SfM alle controles doorstaat. De optie blijft ingeschakeld; het bestaande model kan worden bekeken."),
+    RU("Плотная реконструкция включена, но отложена до прохождения SfM всех проверок. Настройка остаётся включённой; имеющуюся модель можно просмотреть."),
+    TR("Yoğun yeniden oluşturma etkin, ancak SfM tüm kabul kontrollerini geçene kadar ertelendi. Seçenek etkin kalır; mevcut model görüntülenebilir."));
 
 SS_MSG(photos_referenced_in_place,
     EN("Note: the photos are referenced where they are. If you reopen this "
@@ -1880,6 +1885,21 @@ SS_MSG(checkpoint_saved,
 // Labelled rather than inflected ("Steps: 3", not "3 steps") -- see
 // src/i18n/README.md. Steps counts what THIS run did, so it pairs with a
 // time that also excludes whatever a resumed checkpoint already had.
+SS_MSG(training_work,
+    EN("Training step {0}: input images {1}, render views {2}, splats {3}; recent {4} ms/input image"),
+    JA("学習ステップ {0}：入力画像 {1}、描画ビュー {2}、スプラット {3}；直近 {4} ms/入力画像"),
+    ZH_HANS("训练第 {0} 步：输入图 {1} 张，渲染视图 {2} 个，泼溅 {3} 个；近期 {4} 毫秒/输入图"),
+    ZH_HANT("訓練第 {0} 步：輸入圖 {1} 張，算繪視圖 {2} 個，潑濺 {3} 個；近期 {4} 毫秒/輸入圖"),
+    KO("학습 단계 {0}: 입력 이미지 {1}, 렌더 뷰 {2}, 스플랫 {3}; 최근 {4} ms/입력 이미지"),
+    DE("Trainingsschritt {0}: Eingabebilder {1}, Renderansichten {2}, Splats {3}; zuletzt {4} ms/Eingabebild"),
+    FR("Étape {0} : images d’entrée {1}, vues de rendu {2}, splats {3} ; récent {4} ms/image d’entrée"),
+    ES("Paso {0}: imágenes {1}, vistas {2}, splats {3}; reciente {4} ms/imagen"),
+    PT("Passo {0}: imagens {1}, vistas {2}, splats {3}; recente {4} ms/imagem"),
+    IT("Passo {0}: immagini {1}, viste {2}, splat {3}; recente {4} ms/immagine"),
+    NL("Trainingsstap {0}: invoerbeelden {1}, renderweergaven {2}, splats {3}; recent {4} ms/invoerbeeld"),
+    RU("Шаг {0}: изображений {1}, видов {2}, сплатов {3}; недавно {4} мс/изображение"),
+    TR("Eğitim adımı {0}: girdi görüntüsü {1}, görünüm {2}, splat {3}; son {4} ms/girdi görüntüsü"));
+
 SS_MSG(train_finished,
     EN("Training complete. Steps: {0}   Time: {1}"),
     JA("学習が完了しました。ステップ: {0}   所要時間: {1}"),

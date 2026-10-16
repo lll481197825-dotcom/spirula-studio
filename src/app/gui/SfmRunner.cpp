@@ -4,10 +4,12 @@
 
 #include "app/gui/SfmInProcess.h"
 #include "app/gui/SfmPartition.h"
+#include "app/gui/SfmStoredCompletion.h"
 #include "app/gui/TelemetryProbe.h"
 
 #include "sfm/core/Resume.h"
 #include "core/HostMemory.h"
+#include "data/DatasetParser.h"
 
 #include <fstream>
 
@@ -184,6 +186,7 @@ void SfmRunner::start(const SfmJob& job, RunFilms films) {
     _cancel = false;
     _partial = false;
     _not_metric = false;
+    _dense_deferred = false;
     _have_status = false;
     _status_mtime = 0;
     _films = films;
@@ -233,6 +236,7 @@ void SfmRunner::take_reconstruction(SfmJob& job) {
     job.block_neighbours = _live.block_neighbours;
     job.block_radius = _live.block_radius;
     job.block_cache_mb = _live.block_cache_mb;
+    job.regional_work_dir = _live.regional_work_dir;
     job.map_memory_mb = _live.map_memory_mb;
     job.block_cache_auto = _live.block_cache_auto;
     job.overlap = _live.overlap;
@@ -685,6 +689,8 @@ std::vector<std::string> SfmRunner::recon_args(const SfmJob& job,
     }
     if (job.map_memory_mb > 0)
         argv.insert(argv.end(), {"--map-memory-mb", std::to_string(job.map_memory_mb)});
+    if (job.pairs == 4 && !job.regional_work_dir.empty())
+        argv.insert(argv.end(), {"--regional-work-dir", job.regional_work_dir});
     // Only when it says something: a run at the default passes nothing.
     if (job.pairs == 2 || (sequential_window_applies(job) && job.overlap != 10)) {
         argv.push_back("--overlap");
@@ -988,7 +994,8 @@ void SfmRunner::run(SfmJob job) {
             for (const auto& [part, flag] : {std::pair{ModelPart::Features, "--reuse-features"},
                                              std::pair{ModelPart::Matching, "--reuse-matches"}}) {
                 const StepPlan& sp = plan[part];
-                if (sp.act == Act::Keep) settings.insert(settings.end(), {flag, "keep"});
+                if (sp.act == Act::Reuse) settings.insert(settings.end(), {flag, "require"});
+                else if (sp.act == Act::Keep) settings.insert(settings.end(), {flag, "keep"});
                 else if (sp.act == Act::Redo && sp.why == Why::Requested)
                     settings.insert(settings.end(), {flag, "redo"});
             }
@@ -1044,9 +1051,8 @@ void SfmRunner::run(SfmJob job) {
             }
             if (rc == kCancelled || _cancel.load())
                 return fail(lmsg::err_cancelled.get());
-            // Neither 3 (under half the images registered, or a high
-            // reprojection error) nor 4 (no metric frame) is a failure here:
-            // the model still trains, and it cost an hour (src/sfm/README.md).
+            // Codes 3/4 retain a viewable model; incomplete acceptance and metric scale
+            // are separate facts, carried together by the typed result status.
             if (rc == 3 || rc == 4) {
                 // status.bin reports both facts; the exit code can carry only
                 // one of them, and 3 wins when a run is partial AND unscaled.
@@ -1074,6 +1080,14 @@ void SfmRunner::run(SfmJob job) {
                               (reuse_model || has_model(ws / "sparse"));
         if (!modelled && !scanner_stands_in)
             return fail(lmsg::err_no_reconstruction.get());
+        if (reuse_model && !job.lidar.scanner_poses_only) {
+            const auto stored = read_sfm_workspace_completion(ws, [](const std::string& dir) {
+                return find_colmap_model(dir, "");
+            });
+            _partial = stored.partial;
+            _have_status = stored.known;
+            if (_partial) log(lmsg::sfm_partial.get(), false);
+        }
         if (!reuse_model && modelled) record.finish(Step::Model);
 
         // ---- 3. the laser scans: alignment, then their depth and normals ----
@@ -1091,19 +1105,25 @@ void SfmRunner::run(SfmJob job) {
         }
 
         take_dense(job);
-        plan = plan_dataset(plan_job(job), prior, rec, req, &plan, Step::Dense);
-        verify_dense_reuse(plan,ws.string(),_cancel);
-        say(Step::Dense);
-        if (makes(plan[Step::Dense].act)) {
-            record.begin(Step::Dense, dense_fields(job.dense), {"roma.ply"});
-            std::string error;
-            auto dense = job.dense;
-            if (dense.config.mask_dir == "masks" && !prep.mask_dir_cfg.empty()) {
-                dense.config.mask_dir = prep.mask_dir_cfg;
-                dense.config.invert_masks = dense.config.invert_masks != prep.mask_dir_flipped;
+        const auto completion = sfm_completion_policy(_partial.load(), !_not_metric.load(), job.dense.enable, _have_status.load());
+        if (completion.unverified) log(spirula::i18n::msg::dataset::unverified_reconstruction.get(), false);
+        _dense_deferred = completion.defer_dense;
+        if (completion.defer_dense) log(lmsg::sfm_dense_deferred.get(), false);
+        if (completion.run_dense) {
+            plan = plan_dataset(plan_job(job), prior, rec, req, &plan, Step::Dense);
+            verify_dense_reuse(plan,ws.string(),_cancel);
+            if (plan[Step::Dense].act != Act::None) say(Step::Dense);
+            if (makes(plan[Step::Dense].act)) {
+                record.begin(Step::Dense, dense_fields(job.dense), {"roma.ply"});
+                std::string error;
+                auto dense = job.dense;
+                if (dense.config.mask_dir == "masks" && !prep.mask_dir_cfg.empty()) {
+                    dense.config.mask_dir = prep.mask_dir_cfg;
+                    dense.config.invert_masks = dense.config.invert_masks != prep.mask_dir_flipped;
+                }
+                if (!run_dense_step(dense, ws.string(), prep.image_dir, _prog, _cancel, error)) return fail(error);
+                record.finish(Step::Dense);
             }
-            if (!run_dense_step(dense, ws.string(), prep.image_dir, _prog, _cancel, error)) return fail(error);
-            record.finish(Step::Dense);
         }
 
         // ---- 4. depth and normals -------------------------------------------
@@ -1128,7 +1148,7 @@ void SfmRunner::run(SfmJob job) {
         // after the run ends. Only ones this run produced.
         {
             std::lock_guard<std::mutex> lk(_mu);
-            _sweep_dir = job.keep_intermediate || reuse_model ? "" : ws.string();
+            _sweep_dir = job.keep_intermediate || reuse_model || _partial.load() ? "" : ws.string();
         }
 
         if (reads_photos_in_place(job.prep.inputs, job.prep.photo_import))
@@ -1136,6 +1156,10 @@ void SfmRunner::run(SfmJob job) {
 
         set_stage(Stage::Finishing, lmsg::stage_done.get());
         _prog.finish(StageStatus::Done);
+        if (_dense_deferred) {
+            _prog.mark(Stage::Dense, StageStatus::Pending);
+            _prog.detail(Stage::Dense, lmsg::sfm_dense_deferred.get());
+        }
         {
             std::lock_guard<std::mutex> lk(_mu);
             _dataset_dir = ws.string();

@@ -20,18 +20,33 @@ struct SharedTransformResult {
     size_t reference_pairs = 0;
     bool used_uniform = false;
     bool candidate_available = true;
+    size_t visual_components = 0;
+    std::vector<size_t> deferred;
 };
+struct SharedGpsAnchor { uint32_t model = 0; Vec3 centre, position; };
 
 inline SharedTransformResult alignSharedBlocks(SharedIndex& index, size_t minimum_common = 50,
-                                             size_t memory_budget = 256u << 20) {
+                                             size_t memory_budget = 256u << 20,
+                                             const std::set<size_t>& measured_roots = {},
+                                             const std::vector<SharedGpsAnchor>& gps = {},
+                                             bool allow_deferred = false) {
     SharedTransformResult out; out.transforms.resize(index.models);
-    if (index.models <= 1) return out;
+    if (index.models <= 1) { out.visual_components = index.models; return out; }
     Vec3 origin; size_t count = 0;
     for (const auto& p : index.landmarks) if (p.valid) { origin = origin + p.xyz; ++count; }
-    if (!count) throw std::runtime_error("regional coordination: no shared landmarks");
+    if (!count) {
+        for (size_t m = 0; m < index.models; ++m) if (!measured_roots.count(m)) {
+            if (!allow_deferred) throw std::runtime_error("regional coordination: no shared landmarks or measured gauge for every component");
+            if (m) out.deferred.push_back(m);
+        }
+        out.visual_components = index.models; return out;
+    }
     origin = origin * (1. / count); double extent = 0;
     for (const auto& p : index.landmarks) if (p.valid) extent += (p.xyz - origin).dot(p.xyz - origin);
     extent = std::max(1e-6, std::sqrt(extent / count));
+    for (const auto& a : gps) if (a.model >= index.models || !std::isfinite(a.centre.norm()) || !std::isfinite(a.position.norm()))
+        throw std::runtime_error("regional shared GPS anchor invalid");
+    const double gps_huber = 5. / extent;
     struct Pair { Vec3 a, b; };
     struct Edge { uint32_t a = 0, b = 0; std::vector<Pair> pairs; Sim3 b_to_a; };
     std::map<std::pair<uint32_t, uint32_t>, Edge> pairs;
@@ -73,8 +88,17 @@ inline SharedTransformResult alignSharedBlocks(SharedIndex& index, size_t minimu
         e.pairs = std::move(retained); out.edges += e.pairs.size(); edges.push_back(std::move(e));
     }
     out.pair_count = edges.size();
-    std::vector<uint8_t> connected(index.models); connected[0] = 1;
+    std::vector<size_t> parent(index.models); std::iota(parent.begin(), parent.end(), 0);
+    auto component = [&](size_t m) { while (parent[m] != m) { parent[m] = parent[parent[m]]; m = parent[m]; } return m; };
+    for (const auto& e : edges) parent[component(e.a)] = component(e.b);
+    for (size_t m = 0; m < index.models; ++m) out.visual_components += component(m) == m;
+    std::vector<uint8_t> connected(index.models), fixed(index.models); connected[0] = fixed[0] = 1;
     size_t reached = 1;
+    for (size_t m : measured_roots) {
+        if (m >= index.models) throw std::runtime_error("regional measured root out of range");
+        if (!connected[m]) { connected[m] = 1; ++reached; }
+        fixed[m] = 1;
+    }
     for (;;) {
         size_t before = reached;
         for (const auto& e : edges) {
@@ -84,19 +108,41 @@ inline SharedTransformResult alignSharedBlocks(SharedIndex& index, size_t minimu
                 out.transforms[e.a] = composeShared(out.transforms[e.b], inverseShared(e.b_to_a)); connected[e.a] = 1; ++reached;
             }
         }
-        if (reached == before) break;
+        if (reached == before) {
+            auto root = std::find_if(measured_roots.begin(), measured_roots.end(),
+                [&](size_t m) { return m < index.models && !connected[m]; });
+            if (root == measured_roots.end()) break;
+            connected[*root] = fixed[*root] = 1; ++reached;
+        }
     }
-    if (reached != index.models) throw std::runtime_error("regional coordination: shared-landmark block graph is disconnected or degenerate");
+    if (reached != index.models && !allow_deferred)
+        throw std::runtime_error("regional coordination: shared-landmark block graph is disconnected or degenerate");
+    for (size_t m = 0; m < index.models; ++m) if (!connected[m]) {
+        out.deferred.push_back(m); fixed[m] = 1;
+    }
+    edges.erase(std::remove_if(edges.begin(), edges.end(), [&](const Edge& e) {
+        return !connected[e.a] || !connected[e.b];
+    }), edges.end());
+    out.edges = 0; for (const auto& e : edges) out.edges += e.pairs.size();
+    out.pair_count = edges.size();
     std::vector<double> norms;
     for (const auto& e : edges) for (const auto& p : e.pairs)
         norms.push_back((transformPoint(out.transforms[e.a], p.a) - transformPoint(out.transforms[e.b], p.b)).norm());
-    auto middle = norms.begin() + norms.size() / 2; std::nth_element(norms.begin(), middle, norms.end());
-    const double huber = std::max(1e-7, *middle * 2);
+    double huber = 1e-7;
+    if (!norms.empty()) {
+        auto middle = norms.begin() + norms.size() / 2; std::nth_element(norms.begin(), middle, norms.end());
+        huber = std::max(huber, *middle * 2);
+    }
     auto cost = [&](const std::vector<Sim3>& t) {
         double sum = 0;
         for (const auto& e : edges) for (const auto& p : e.pairs) {
             double d = (transformPoint(t[e.a], p.a) - transformPoint(t[e.b], p.b)).norm();
             sum += d <= huber ? d * d : huber * (2 * d - huber);
+        }
+        for (const auto& a : gps) if (connected[a.model]) {
+            const double d = (transformPoint(t[a.model], (a.centre - origin) * (1. / extent)) -
+                (a.position - origin) * (1. / extent)).norm();
+            sum += d <= gps_huber ? d * d : gps_huber * (2 * d - gps_huber);
         }
         return sum;
     };
@@ -122,15 +168,27 @@ inline SharedTransformResult alignSharedBlocks(SharedIndex& index, size_t minimu
                 ja[7 * row + k] *= -1; jb[7 * row + k] *= -1;
             }
             auto add = [&](uint32_t a, uint32_t b, const auto& x, const auto& y) {
-                if (!a || !b) return;
+                if (fixed[a] || fixed[b]) return;
                 auto& block = blocks[{a - 1, b - 1}];
                 for (int i = 0; i < 7; ++i) for (int j = 0; j < 7; ++j)
                     for (int k = 0; k < 3; ++k) block[7 * i + j] += w * x[7 * k + i] * y[7 * k + j];
             };
             add(e.a,e.a,ja,ja); add(e.b,e.b,jb,jb); add(e.a,e.b,ja,jb);
             for (auto side : {0,1}) {
-                uint32_t m = side ? e.b : e.a; if (!m) continue; const auto& j = side ? jb : ja;
+                uint32_t m = side ? e.b : e.a; if (fixed[m]) continue; const auto& j = side ? jb : ja;
                 for (int k = 0; k < 7; ++k) for (int row = 0; row < 3; ++row) g[7 * (m - 1) + k] += w * j[7 * row + k] * r[row];
+            }
+        }
+        for (const auto& a : gps) if (!fixed[a.model]) {
+            const Vec3 y = mul(out.transforms[a.model].R, (a.centre - origin) * (1. / extent)) * out.transforms[a.model].scale;
+            const Vec3 residual = y + out.transforms[a.model].t - (a.position - origin) * (1. / extent);
+            const double w = residual.norm() > gps_huber ? gps_huber / residual.norm() : 1.;
+            const double r[3] = {residual.x, residual.y, residual.z};
+            const std::array<double, 21> j{0,y.z,-y.y,1,0,0,y.x, -y.z,0,y.x,0,1,0,y.y, y.y,-y.x,0,0,0,1,y.z};
+            const uint32_t m = a.model - 1; auto& h = blocks[{m, m}];
+            for (int i = 0; i < 7; ++i) for (int row = 0; row < 3; ++row) {
+                g[7 * m + i] += w * j[7 * row + i] * r[row];
+                for (int k = 0; k < 7; ++k) h[7 * i + k] += w * j[7 * row + i] * j[7 * row + k];
             }
         }
         double grad = 0;
@@ -161,11 +219,13 @@ inline SharedTransformResult alignSharedBlocks(SharedIndex& index, size_t minimu
         }
         auto next = out.transforms; double alpha = 1;
         for (size_t m = 1; m < index.models; ++m) {
+            if (fixed[m]) continue;
             const double* s = step.data() + 7 * (m - 1);
             alpha = std::min(alpha, .25 / std::max(.25, Vec3{s[0],s[1],s[2]}.norm()));
             alpha = std::min(alpha, .25 / std::max(.25, std::abs(s[6])));
         }
         for (size_t m = 1; m < index.models; ++m) {
+            if (fixed[m]) continue;
             const double* s = step.data() + 7 * (m - 1);
             next[m].R = mul(angleAxisToRotation({alpha*s[0],alpha*s[1],alpha*s[2]}), next[m].R);
             next[m].t = next[m].t + Vec3{alpha*s[3],alpha*s[4],alpha*s[5]}; next[m].scale *= std::exp(alpha*s[6]);
@@ -184,27 +244,32 @@ inline SharedTransformResult alignSharedBlocks(SharedIndex& index, size_t minimu
     out.rms = extent * std::sqrt(squared / std::max<size_t>(1,out.edges));
     for (auto& t : out.transforms) t.t = origin + t.t * extent - mul(t.R,origin) * t.scale;
     for (auto& p : index.landmarks) if (p.valid) {
-        p.xyz = {};
-        for (auto& m : p.members) { m.xyz = transformPoint(out.transforms[m.model],m.xyz); p.xyz = p.xyz + m.xyz; }
-        p.xyz = p.xyz * (1. / p.members.size());
+        p.xyz = {}; size_t live = 0;
+        for (auto& m : p.members) if (connected[m.model]) {
+            m.xyz = transformPoint(out.transforms[m.model],m.xyz); p.xyz = p.xyz + m.xyz; ++live;
+        }
+        if (live) p.xyz = p.xyz * (1. / live); else p.valid = false;
     }
     return out;
 }
 
 inline SharedTransformResult guardedSharedAlignment(SharedIndex& index, size_t minimum_common = 50,
-                                                   size_t memory_budget = 256u << 20) {
+                                                   size_t memory_budget = 256u << 20,
+                                                   const std::set<size_t>& measured_roots = {},
+                                                   const std::vector<SharedGpsAnchor>& gps = {},
+                                                   bool allow_deferred = false) {
     SharedIndex reference; reference.models = index.models;
     reference.landmarks = std::move(index.alignment_reference);
     std::optional<SharedTransformResult> uniform;
     if (!reference.landmarks.empty()) {
-        try { uniform = alignSharedBlocks(reference, minimum_common, memory_budget); }
+        try { uniform = alignSharedBlocks(reference, minimum_common, memory_budget, measured_roots, gps, allow_deferred); }
         catch (const Cancelled&) { throw; }
         catch (const std::runtime_error& e) {
             slog::diag(slog::Tag::Map, "[regional] uniform alignment unavailable; protected seam sample required: %s\n", e.what());
         }
     }
     SharedTransformResult candidate;
-    try { candidate = alignSharedBlocks(index, minimum_common, memory_budget); }
+    try { candidate = alignSharedBlocks(index, minimum_common, memory_budget, measured_roots, gps, allow_deferred); }
     catch (const Cancelled&) { throw; }
     catch (const std::runtime_error& e) {
         if (!uniform) throw;
@@ -217,6 +282,7 @@ inline SharedTransformResult guardedSharedAlignment(SharedIndex& index, size_t m
         uniform->used_uniform = true; uniform->candidate_available = false; return *uniform;
     }
     if (!uniform) return candidate;
+    if (allow_deferred && candidate.deferred != uniform->deferred) return candidate;
     std::vector<Sim3> inverse_uniform;
     for (const auto& t : uniform->transforms) inverse_uniform.push_back(inverseShared(t));
     std::vector<double> distances;

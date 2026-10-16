@@ -1,5 +1,6 @@
 #pragma once
 #include "app/gui/SfmPartition.h"
+#include "app/gui/SfmCompletion.h"
 
 // SfmRunner -- turns raw images or a video into a trainable dataset using this
 // repository's own structure-from-motion, with nothing else installed.
@@ -138,6 +139,7 @@ struct SfmJob {
     int block_neighbours = 40;
     float block_radius = 0;
     int block_cache_mb = 512;
+    std::string regional_work_dir;
     int map_memory_mb = 0;
     bool block_cache_auto = true;
     int overlap = 10;                 // sequential neighbours
@@ -303,12 +305,13 @@ public:
     // leaving the dataset screen, or closing the app. A no-op while a run is
     // going, and for a job that asked to keep them.
     void sweep_intermediates();
-    // Done, but under half the images registered (or a high reprojection
-    // error). The dataset is usable; the user should know it has gaps.
+    // A model exists, but the run did not pass its complete reconstruction acceptance.
     bool partial() const { return _partial.load(); }
     // Done, but the metric frame asked for could not be fitted: the model is
     // in its own units, not metres.
     bool not_metric() const { return _not_metric.load(); }
+    bool dense_deferred() const { return _dense_deferred.load(); }
+    bool completion_known() const { return _have_status.load(); }
 
 private:
     void run(SfmJob job);
@@ -341,8 +344,9 @@ private:
     std::atomic<bool> _cancel{false};
     std::atomic<bool> _partial{false};
     std::atomic<bool> _not_metric{false};
+    std::atomic<bool> _dense_deferred{false};
     // The child said how it ended, so the exit code need not be interpreted.
-    bool _have_status = false;
+    std::atomic<bool> _have_status{false};
     int64_t _status_mtime = 0;
     RunProgress _prog;
     RunFilms _films;

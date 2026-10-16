@@ -561,17 +561,20 @@ inline bool estimateSim3FromPoses(const std::vector<Pose>& src, const std::vecto
 // ---- reprojection helpers on a standalone Reconstruction ----------------
 // The mapper computes these against its FeatureSets; a merge only has the
 // models, whose `points2D` carry the same keypoint coordinates.
-inline double reprojErrorAt(const Camera& cam, const Pose& pose, const Vec2& obs, const Vec3& X) {
+inline double reprojErrorAt(const Camera& cam, const Pose& pose, const Vec2& obs, const Vec3& X, bool* valid = nullptr) {
     Vec3 pc = mul(pose.R, X) + pose.t;
+    if (valid) *valid = true;
     // Cheirality, as the mapper does it (D33): the pinhole family tests z, a
     // wide-FOV camera (which sees past 90 deg) tests the sign along the ray.
     if (cam.wideFov()) {
-        if (pc.dot(cam.bearing(obs)) <= 0) return 1e30;
+        if (pc.dot(cam.bearing(obs)) <= 0) { if (valid) *valid = false; return 1e30; }
     } else if (pc.z < 1e-8) {
+        if (valid) *valid = false;
         return 1e30;
     }
     Vec2 px = cam.project(pc);
-    return std::hypot(px.x - obs.x, px.y - obs.y);
+    const double dx = cam.isSpherical() ? std::remainder(px.x - obs.x, double(cam.width)) : px.x - obs.x;
+    return std::hypot(dx, px.y - obs.y);
 }
 
 inline size_t countObservations(const Reconstruction& rec) {

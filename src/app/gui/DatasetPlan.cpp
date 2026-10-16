@@ -476,6 +476,7 @@ void apply_legacy_recon(const std::vector<std::string>& a, const std::string& im
     job.block_size_auto = job.block_cache_auto = true;
     job.block_size = 2000;
     job.block_cache_mb = 512;
+    job.regional_work_dir.clear();
     job.map_memory_mb = 0;
     job.block_neighbours = 40;
     job.block_radius = 0;
@@ -519,6 +520,7 @@ void apply_legacy_recon(const std::vector<std::string>& a, const std::string& im
             job.block_cache_mb = (int)to_float(take());
             job.block_cache_auto = false;
         }
+        else if (flag == "--regional-work-dir") job.regional_work_dir = take();
         else if (flag == "--overlap") job.overlap = (int)to_float(take());
         else if (flag == "--map-memory-mb") job.map_memory_mb = (int)to_float(take());
         else if (flag == "--no-loop-closure") job.loop_closure = false;

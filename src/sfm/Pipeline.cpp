@@ -38,6 +38,7 @@
 #include "sfm/core/Progress.h"
 #include "sfm/core/CameraSetup.h"
 #include "sfm/core/FeatureCompaction.h"
+#include "sfm/core/FeatureIdentity.h"
 #include "sfm/core/Log.h"
 #include "sfm/core/Features.h"
 #include "sfm/core/Image.h"
@@ -1273,8 +1274,9 @@ SequenceTable buildSequences(const MatchesDatabase& db, const SfmConfig& cfg, bo
 }
 
 void configureMappingMemory(SfmConfig& cfg, const std::string& scratch_dir) {
-    const auto limits = mappingMemoryLimits(spirula::physicalRamBytes(), spirula::availableRamBytes(),
-                                            cfg.map_memory_mb);
+    const auto physical = spirula::physicalRamBytes();
+    const auto available = spirula::availableRamBytes();
+    const auto limits = mappingMemoryLimits(physical, available, cfg.map_memory_mb);
     if (limits.working_bytes < (size_t{32} << 20))
         throw std::runtime_error("mapping: insufficient available host memory; release memory "
                                  "and resume using the existing features and matches");
@@ -1288,15 +1290,15 @@ void configureMappingMemory(SfmConfig& cfg, const std::string& scratch_dir) {
     cfg.bup.model_memory_bytes = limits.working_bytes;
     cfg.manager.merge.host_budget_bytes = limits.working_bytes - limits.working_bytes / 3;
     cfg.bup.scratch_dir = scratch_dir;
-    if (cfg.bup.atom.threads == 0)
-        cfg.bup.atom.max_threads = std::max(1, std::min(4,
-            (int)(limits.working_bytes / (size_t{256} << 20))));
+    cfg.bup.atom.host_budget_bytes = limits.working_bytes;
     if (!cfg.quiet)
         L::diag(Tag::Map,
                 "[map] working memory: %.0f MiB; graph cache: %.0f MiB; BA host: %.0f MiB; "
+                "physical: %.0f MiB; available: %.0f MiB; requested: %d MiB (0=automatic); "
                 "completed atoms use disk storage",
                 limits.working_bytes / 1048576.0, cfg.mapper.graph_cache_bytes / 1048576.0,
-                limits.bundle_bytes / 1048576.0);
+                limits.bundle_bytes / 1048576.0, physical / 1048576.0, available / 1048576.0,
+                cfg.map_memory_mb);
 }
 
 std::vector<Reconstruction> runMapper(Mapper& mapper, const MatchesDatabase& db,
@@ -1443,28 +1445,8 @@ void warnIfMasksLookInverted(const ExtractStats& st) {
 
 namespace {
 
-// The feature files as matching indexes them -- name, size and write time --
-// folded into one token, since its leftovers are indices into this set. The
-// write time is what sees a RE-extracted image: its size is the same budget.
 std::string featureDirDigest(const fs::path& featdir) {
-    std::vector<std::string> rows;
-    std::error_code walk, ec;
-    for (auto it = fs::recursive_directory_iterator(featdir, walk);
-         !walk && it != fs::recursive_directory_iterator(); it.increment(walk))
-        if (it->is_regular_file(ec))
-            rows.push_back(
-                it->path().generic_string() + ":" +
-                std::to_string((uint64_t)fs::file_size(it->path(), ec)) + ":" +
-                std::to_string((int64_t)fs::last_write_time(it->path(), ec)
-                                   .time_since_epoch()
-                                   .count()));
-    std::sort(rows.begin(), rows.end());
-    uint64_t h = 1469598103934665603ull;   // FNV-1a
-    for (const std::string& s : rows)
-        for (unsigned char c : s) { h ^= c; h *= 1099511628211ull; }
-    char buf[24];
-    std::snprintf(buf, sizeof buf, "%016llx.%zu", (unsigned long long)h, rows.size());
-    return buf;
+    return resume::featureDirectoryIdentity(featdir);
 }
 
 // Anything under `outdir` that is not one of `live`: matching reads every .bin
@@ -1640,7 +1622,8 @@ int extractDirectory(const std::string& imagedir, const fs::path& outdir,
         outs[k].replace_extension(".bin");
         live.insert(outs[k]);
     }
-    sweepStaleFeatures(outdir, live);
+    const bool require_features = cfg.reuse_features == "require" || cfg.reuse_matches == "require";
+    if (!require_features) sweepStaleFeatures(outdir, live);
 
     events::stage_begin(Stage::Extract, (int64_t)n_all);
     if (reuse) {
@@ -1654,7 +1637,8 @@ int extractDirectory(const std::string& imagedir, const fs::path& outdir,
                                           : std::string();
             bool older = false;
             if (!featuresAreCurrent(outs[k], paths[k], mask, fmask, count,
-                                    trusted ? &older : nullptr)) {
+                                    trusted && !require_features ? &older : nullptr)) {
+                resume::requireReusable(require_features ? "require" : "auto", false, "feature");
                 todo.push_back(k);
                 continue;
             }
@@ -2445,6 +2429,8 @@ AutoResult run_auto(SfmConfig& cfg, const AutoInputs& in) {
     std::error_code rm_ec;
     bool reuse = cfg.reuse && cfg.reuse_features != "redo";
     const bool keep_features = reuse && cfg.reuse_features == "keep";
+    if (cfg.reuse_features == "require" || cfg.reuse_matches == "require")
+        resume::requireReusable("require", reuse && old_extract == extract_sig, "feature");
     if (!reuse || (!keep_features && old_extract != extract_sig)) {
         // The pair list and the journal index the feature files, so they go
         // wherever those go.
@@ -2521,13 +2507,15 @@ AutoResult run_auto(SfmConfig& cfg, const AutoInputs& in) {
         fs::last_write_time(p, fs::file_time_type::clock::now(), rm_ec);
     MatchResume mres;
     mres.dir = rdir;
-    mres.signature =
-        extract_sig + match_settings + "features=" + featureDirDigest(featdir) + "\n";
+    const auto feature_identity = trusted.empty() ? features_before : "features=" + featureDirDigest(featdir) + "\n";
+    mres.signature = extract_sig + match_settings + feature_identity;
     const std::string old_match = resume::recorded(rdir / resume::kMatchSig);
     // Matches over features kept under other extraction settings are still
     // theirs: the digest is of the files they index, as they were then.
     const bool current =
-        old_match == mres.signature || old_match == old_extract + match_settings + features_before;
+        resume::equivalentSignatures(old_match, mres.signature) ||
+        resume::equivalentSignatures(old_match, old_extract + match_settings + features_before);
+    resume::requireReusable(cfg.reuse_matches, cfg.reuse && current && fs::exists(matchpath), "matching");
     if (cfg.reuse_matches == "redo") {
         resume::forget(rdir / resume::kMatchSig);
         resume::forget(rdir / resume::kMatchJournal);
@@ -2550,7 +2538,7 @@ AutoResult run_auto(SfmConfig& cfg, const AutoInputs& in) {
             if (!indexMatches(matchpath.string(), index) || index.images.size() != est.images)
                 throw std::runtime_error("regional mapping: kept matches do not cover the extracted photos");
             L::out(Tag::Match, M::match_reusing_matches, {(long long)index.pairs.size(), matchpath.string()});
-            if (auto result = run_regional(cfg, matchpath.string(), featdir.string(), _imagedir, sparsedir)) return *result;
+            if (auto result = run_regional(cfg, matchpath.string(), featdir.string(), _imagedir, sparsedir, &index)) return *result;
         }
         try {
             MatchesDatabase disk = readMatches(matchpath.string());

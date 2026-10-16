@@ -615,7 +615,8 @@ namespace {
 // which device, how much it says about it.
 bool signatureRelevant(const char* name) {
     for (const char* n : {"threads", "decode-threads", "decode-budget", "device",
-                          "quiet", "profile", "spv-path"})
+                          "quiet", "profile", "spv-path", "block-cache-mb", "regional-work-dir",
+                          "reuse-features", "reuse-matches"})
         if (std::strcmp(name, n) == 0) return false;
     return true;
 }

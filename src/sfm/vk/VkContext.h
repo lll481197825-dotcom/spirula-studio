@@ -20,6 +20,7 @@
 #include "core/Env.h"
 #include "core/SourcePath.h"
 #include "core/VulkanDeviceSelection.h"
+#include "core/VulkanMemoryBudget.h"
 
 #include "sfm/core/Log.h"
 #include "i18n/catalog/Sfm.h"
@@ -174,6 +175,31 @@ struct VkDeviceCaps {
     bool intDotProductFast = false;
 };
 
+
+struct VkDeviceMemoryCapacity {
+    uint64_t heap_bytes = 0, budget_bytes = 0, usage_bytes = 0;
+    uint64_t available_bytes = 0, reserve_bytes = 0;
+    uint32_t heap_index = VK_MAX_MEMORY_HEAPS;
+    bool budget_known = false, fallback = true;
+
+    static VkDeviceMemoryCapacity fromHeap(uint64_t heap, uint64_t trackedUsage,
+                                           const spirula::vkmemory::Budget& driverBudget,
+                                           bool budgetSupported) {
+        VkDeviceMemoryCapacity out;
+        out.heap_bytes = heap;
+        out.budget_known = budgetSupported && driverBudget.budget_bytes &&
+                           driverBudget.budget_bytes <= heap;
+        out.fallback = !out.budget_known;
+        out.budget_bytes = out.budget_known ? driverBudget.budget_bytes : heap / 2;
+        out.usage_bytes = out.budget_known ? driverBudget.usage_bytes : trackedUsage;
+        out.available_bytes = out.budget_bytes > out.usage_bytes ?
+                              out.budget_bytes - out.usage_bytes : 0;
+        out.reserve_bytes = std::min(out.available_bytes,
+            std::max<uint64_t>(256ull << 20, out.budget_bytes / 20));
+        return out;
+    }
+};
+
 // The resolver's reason for the last refused device request in this thread.
 // Kept beside the context rather than in it: the failure happens before any
 // context exists, and the caller (or the test) needs the wording.
@@ -199,12 +225,7 @@ public:
     VkContext(const VkContext&) = delete;
     VkContext& operator=(const VkContext&) = delete;
 
-    // Full teardown. Every buffer ever created through this context is freed
-    // here (createBufferRaw tracks them), so a scoped VkContext -- the mapper's
-    // per-global-BA solver, the prefilter's matcher -- returns its VRAM when
-    // it dies instead of leaking it for the life of the process. Before this,
-    // a 1363-image run OOMed: each of the mapper's periodic global BAs leaked
-    // a device plus problem-sized buffers.
+    // Scoped contexts return every tracked allocation when a stage finishes.
     ~VkContext() {
         if (device_ == VK_NULL_HANDLE) {
             if (instance_ != VK_NULL_HANDLE) vkDestroyInstance(instance_, nullptr);
@@ -220,8 +241,8 @@ public:
         if (stagingPtr_) vkUnmapMemory(device_, staging_.mem);
         if (stagingDlPtr_) vkUnmapMemory(device_, stagingDl_.mem);
         for (auto& a : allocations_) {
-            vkDestroyBuffer(device_, a.first, nullptr);
-            vkFreeMemory(device_, a.second, nullptr);
+            vkDestroyBuffer(device_, a.buffer, nullptr);
+            vkFreeMemory(device_, a.memory, nullptr);
         }
         if (fence_ != VK_NULL_HANDLE) vkDestroyFence(device_, fence_, nullptr);
         if (cmdPool_ != VK_NULL_HANDLE) vkDestroyCommandPool(device_, cmdPool_, nullptr);
@@ -435,6 +456,8 @@ public:
         VkPhysicalDeviceShaderAtomicFloatFeaturesEXT fAtom{
             VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_ATOMIC_FLOAT_FEATURES_EXT};
         std::vector<const char*> exts;
+        memoryBudgetSupported_ = hasDeviceExtension(phys_, VK_EXT_MEMORY_BUDGET_EXTENSION_NAME);
+        if (memoryBudgetSupported_) exts.push_back(VK_EXT_MEMORY_BUDGET_EXTENSION_NAME);
         // Mandatory where advertised: the spec forbids creating a device from
         // a portability physical device without it. Spelled out rather than
         // using the macro, which is behind VK_ENABLE_BETA_EXTENSIONS.
@@ -498,6 +521,12 @@ public:
         vkGetDeviceQueue(device_, queueFamily_, 0, &queue_);
 
         vkGetPhysicalDeviceMemoryProperties(phys_, &memProps_);
+        for (uint32_t i = 0; i < memProps_.memoryTypeCount; ++i) {
+            if (memProps_.memoryTypes[i].propertyFlags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) {
+                deviceLocalHeapIndex_ = memProps_.memoryTypes[i].heapIndex;
+                break;
+            }
+        }
 
         VkCommandPoolCreateInfo cpi{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
         cpi.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
@@ -553,7 +582,8 @@ public:
         vkDestroyBuffer(device_, b.buf, nullptr);
         vkFreeMemory(device_, b.mem, nullptr);
         for (size_t i = 0; i < allocations_.size(); i++)
-            if (allocations_[i].first == b.buf) {
+            if (allocations_[i].buffer == b.buf) {
+                heapAllocated_[allocations_[i].heap] -= allocations_[i].bytes;
                 allocations_.erase(allocations_.begin() + i);
                 break;
             }
@@ -926,6 +956,21 @@ public:
     // NVIDIA, which wraps an access past it rather than failing) and the
     // allocation limit (4 GB on RADV), whatever VRAM is free.
     VkDeviceSize maxBufferBytes() const { return maxBufferBytes_; }
+    // The first DEVICE_LOCAL type matches createBufferRaw's preference; buffer
+    // compatibility can select another heap. EXT usage covers this process's
+    // allocations; its dynamic budget also reflects pressure from other apps.
+    VkDeviceMemoryCapacity deviceMemoryCapacity() const {
+        if (!initialized() || deviceLocalHeapIndex_ >= memProps_.memoryHeapCount) return {};
+        spirula::vkmemory::Budget budget;
+        if (memoryBudgetSupported_)
+            budget = spirula::vkmemory::queryBudget(phys_, deviceLocalHeapIndex_);
+        auto out = VkDeviceMemoryCapacity::fromHeap(
+            memProps_.memoryHeaps[deviceLocalHeapIndex_].size,
+            heapAllocated_[deviceLocalHeapIndex_], budget, memoryBudgetSupported_);
+        out.heap_index = deviceLocalHeapIndex_;
+        return out;
+    }
+
     double deviceLocalHeapMB() const {
         VkDeviceSize best = 0;
         for (uint32_t i = 0; i < memProps_.memoryHeapCount; i++)
@@ -1101,7 +1146,9 @@ private:
             throw VkError(r, vkErrorText(r, SS_FILE, __LINE__));
         }
         VK_CHECK(vkBindBufferMemory(device_, b.buf, b.mem, 0));
-        allocations_.emplace_back(b.buf, b.mem);
+        const uint32_t heap = memProps_.memoryTypes[typeIdx].heapIndex;
+        allocations_.push_back({b.buf, b.mem, req.size, heap});
+        heapAllocated_[heap] += req.size;
         return b;
     }
 
@@ -1116,6 +1163,9 @@ private:
     VkQueue queue_ = VK_NULL_HANDLE;
     uint32_t queueFamily_ = 0;
     VkPhysicalDeviceMemoryProperties memProps_{};
+    bool memoryBudgetSupported_ = false;
+    uint32_t deviceLocalHeapIndex_ = VK_MAX_MEMORY_HEAPS;
+    VkDeviceSize heapAllocated_[VK_MAX_MEMORY_HEAPS] = {};
     VkCommandPool cmdPool_ = VK_NULL_HANDLE;
     VkFence fence_ = VK_NULL_HANDLE;
     VkCommandBuffer pending_ = VK_NULL_HANDLE;  // submitAsync()'s, until waited for
@@ -1137,7 +1187,13 @@ private:
     void* stagingPtr_ = nullptr;
     void* stagingDlPtr_ = nullptr;
     VkDeviceSize totalAllocated_ = 0;
-    std::vector<std::pair<VkBuffer, VkDeviceMemory>> allocations_;  // freed in ~VkContext
+    struct Allocation {
+        VkBuffer buffer;
+        VkDeviceMemory memory;
+        VkDeviceSize bytes;
+        uint32_t heap;
+    };
+    std::vector<Allocation> allocations_;
 
     static constexpr uint32_t kMaxQueries = 16384;
     bool profiling_ = false;

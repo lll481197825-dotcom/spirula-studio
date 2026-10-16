@@ -59,6 +59,12 @@ inline void unpackReals(std::vector<double>& out, const uint8_t* v, size_t n, Re
     }
 }
 
+inline double unpackRealAt(const uint8_t* values, size_t index, RealCfg cfg) {
+    if (cfg == RealCfg::F32) { float value; memcpy(&value, values + 4 * index, 4); return value; }
+    if (cfg == RealCfg::DF64) { float parts[2]; memcpy(parts, values + 8 * index, 8); return double(parts[0]) + double(parts[1]); }
+    double value; memcpy(&value, values + 8 * index, 8); return value;
+}
+
 enum class SolverSel { Auto, Dense, CG };
 enum class CgFallback { Auto, On, Off };
 

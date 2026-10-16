@@ -372,6 +372,15 @@ int main() {
             touch(spatial_ws / "matches.bin");
             touch(spatial_ws / sfm::resume::kDir / sfm::resume::kExtractSig);
             touch(spatial_ws / sfm::resume::kDir / sfm::resume::kMatchSig);
+            SfmJob relocated = spatial;
+            relocated.regional_work_dir = "other volume/regions";
+            const DatasetPlan original_plan = plan(spatial);
+            const DatasetPlan relocated_plan = plan(relocated);
+            expect(relocated_plan[Step::Model].act == original_plan[Step::Model].act &&
+                       relocated_plan[ModelPart::Features].act == original_plan[ModelPart::Features].act &&
+                       relocated_plan[ModelPart::Matching].act == original_plan[ModelPart::Matching].act &&
+                       relocated_plan[ModelPart::Mapping].act == original_plan[ModelPart::Mapping].act,
+                   "changing the work volume preserves geometric outputs and matching");
             for (int field = 0; field < 4; ++field) {
                 SfmJob changed = spatial;
                 if (field == 0) ++changed.block_size;

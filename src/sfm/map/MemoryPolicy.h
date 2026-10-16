@@ -17,8 +17,12 @@ inline MappingMemoryLimits mappingMemoryLimits(size_t total, size_t available,
                                                int requested_mb = 0) {
     constexpr size_t mib = size_t{1024} * 1024;
     size_t budget = requested_mb > 0 ? size_t(requested_mb) * mib
-                                    : total ? total / 2 : 2048 * mib;
-    if (available) budget = std::min(budget, available - available / 4);
+                                    : total ? total - total / 5 : 2048 * mib;
+    if (total) budget = std::min(budget, total - total / 5);
+    if (available) {
+        const size_t reserve = std::min<size_t>(4096 * mib, available / 4);
+        budget = std::min(budget, available - reserve);
+    }
     return {budget, std::min(512 * mib, budget / 8), budget / 2};
 }
 

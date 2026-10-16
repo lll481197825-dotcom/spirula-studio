@@ -197,12 +197,48 @@ static void testRefusalsAndFailures(const Scene& scene, const Reconstruction& mo
     std::puts("  refused sources / non-progress / oversized model: PASS");
 }
 
+static void testResourceScheduler(const Scene& scene) {
+    using namespace atom_scheduling;
+    std::vector<Job> light(32); for (auto& job : light) job.credit = {100, 100};
+    Limits limits; limits.host = limits.device = 100000; limits.hardware = 16; limits.context_host = limits.context_device = 20;
+    auto full = plan(light, limits); require(full.workers == 16, "auto atom scheduler retained a fixed 4/8 cap");
+    limits.requested = 30; require(plan(light, limits).workers == 16, "explicit workers oversubscribed hardware CPU slots");
+    limits.requested = 2; require(plan(light, limits).workers == 2, "user worker ceiling ignored");
+    Pool inner(light, {100000,100000}, 16, 2); const auto a = inner.acquire(), b = inner.acquire();
+    require(a.threads == 8 && b.threads == 8 && inner.stats().peak_cpu == 16, "resource-limited workers did not receive available CPU quotas"); inner.release(a.task); inner.release(b.task);
+    Pool all(light, {100000,100000}, 16, 16); std::vector<Pool::Lease> acquired;
+    for (int i = 0; i < 16; ++i) { acquired.push_back(all.acquire()); require(acquired.back().threads == 1, "inner CPU borrowing starved runnable outer atoms"); }
+    require(all.stats().peak_cpu == 16, "CPU admission failed to fill hardware slots"); for (const auto lease : acquired) all.release(lease.task);
+    limits.requested = 0; limits.device = 500; auto constrained = plan(light, limits);
+    require(constrained.workers == 4 && constrained.contexts_device == 80 && constrained.pool.device == 420, "device/context aggregation not enforced");
+    Pool bounded(light, constrained.pool, 16, constrained.workers); std::vector<std::thread> workers;
+    for (uint32_t t=0; t<constrained.workers; ++t) workers.emplace_back([&] { for (;;) { auto lease = bounded.acquire(); if (lease.task == light.size()) break; std::this_thread::yield(); bounded.release(lease.task); } });
+    for (auto& worker : workers) worker.join(); const auto stats = bounded.stats();
+    require(stats.completed == light.size() && stats.peak_host <= constrained.pool.host && stats.peak_device <= constrained.pool.device && stats.peak_cpu <= 16, "concurrent credit pool exceeded aggregate capacity");
+    limits.device = 50; bool failed = false; try { plan(light, limits); } catch (const std::length_error&) { failed = true; } require(failed, "single oversized atom silently admitted");
+    std::vector<Job> uneven(3); uneven[0].credit = {90,90}; uneven[1].credit = uneven[2].credit = {10,10}; Pool mixed(uneven,{100,100},16,2);
+    auto big=mixed.acquire(), tiny=mixed.acquire(); require(big.task==0 && tiny.task==1, "variable resource queue failed to fill remaining capacity"); mixed.release(big.task); auto next=mixed.acquire(); require(next.task==2, "variable resource queue did not progress after release"); mixed.release(tiny.task); mixed.release(next.task);
+    std::atomic<bool> stop{true}; cancel::set_token(&stop); failed=false; try { mixed.acquire(); } catch (const Cancelled&) { failed=true; } cancel::set_token(nullptr); require(failed, "credit admission ignored cancellation");
+    bool overflow=false; try { multiply(UINT64_MAX, 2); } catch(const std::length_error&) { overflow=true; } require(overflow,"atom forecast byte overflow not checked");
+    AtomOptions options; options.init_trials=1; options.model_trials=1; options.verbose=false; options.host_budget_bytes=size_t{64}<<20;
+    options.threads=2; const auto cams=std::map<uint32_t,Camera>{{1,Camera::defaultFor(1,1280,960,1200)}}; const auto ids=std::vector<uint32_t>(Scene::views,1);
+    const std::vector<uint32_t> one{0,1,2,3,4,5,6,7}; AtomStats measured;
+    auto nativeOptions=cpuOptions(); nativeOptions.threads=0;
+    auto results=reconstructAtoms(scene.db,scene.feats,nativeOptions,ids,cams,{one,one},options,measured);
+    require(results.size()==2 && measured.threads==2,"native CPU atom resource integration failed"); for(auto& rec:results) checkModel(rec,rec.points3D.size());
+    const auto adj=detail::pairAdjacency(scene.db); std::vector<uint8_t> membership(Scene::views);
+    auto forecast=detail::forecastAtomResources(scene.db,scene.feats,adj,one,cpuOptions(),false,0,membership);
+    require(forecast.credit.host>forecast.solver_host && forecast.solver_device==0 && forecast.model_bytes>=modelResidentBytes(results.front()), "native atom forecast omitted models or solver allowance");
+    std::puts("  adaptive atoms: hardware/user ceilings, host/device/context credits, outer/inner CPU quotas, uneven queue, cancellation, native CPU reconstruction: PASS");
+}
+
 static int runTests(int, char**) {
     Scene scene;
     Mapper mapper(scene.db, scene.feats, cpuOptions());
     const auto models = mapper.run();
     require(models.size() == 1 && models.front().points3D.size() >= 100, "synthetic CPU fixture failed");
     checkModel(models.front(), models.front().points3D.size());
+    testResourceScheduler(scene);
     testCompaction(scene, models.front());
     testRefusalsAndFailures(scene, models.front());
     std::puts("sfm_bottomup_memory_test: PASS");

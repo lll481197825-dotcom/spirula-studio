@@ -102,6 +102,14 @@ static int cmdLiveMatchesTest(int, char**) {
     MatchesIndex fin;
     check(indexMatches(done, fin), "index a finished file");
     check(fin.pairs.size() == 1, "finished file indexes its pairs");
+    const std::string payload_short = dir + "/payload-short.bin";
+    std::filesystem::copy_file(done, payload_short);
+    std::filesystem::resize_file(payload_short, fin.pairs.at(0).offset + sizeof(FeatureMatch));
+    std::ifstream short_reader(payload_short, std::ios::binary);
+    std::vector<FeatureMatch> short_matches;
+    check(!readPairMatches(short_reader, fin.pairs.at(0), short_matches) && short_matches.empty(),
+          "truncated match payload returned partial correspondences");
+    short_reader.close();
 
     // A fixed-count file that IS truncated is still an error, not a prefix.
     {

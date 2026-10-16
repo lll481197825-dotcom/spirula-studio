@@ -25,9 +25,11 @@
 interface ICameraModel : IDifferentiable {
     static const int kNumIntr;
     static const bool kPeriodicX;
+    static const int kDirectionForwardZ;
     [Differentiable] static This fromArray(Real v[kNumIntr]);
     // p is the point in camera frame; returns projected pixel coordinates.
     [Differentiable] RVec2 project(RVec3 p);
+    bool directionFront(RVec3 p, RVec2 observation);
 };
 
 // theta^2 below which the rotation is Ceres' first-order p + aa x p: its
@@ -53,9 +55,24 @@ RVec3 applyPose(Real pose[6], RVec3 p_world) {
     return angleAxisRotate(aa, p_world) + t;
 }
 
+Real directionKBTheta(Real rd, Real k1, Real k2, Real k3, Real k4) {
+    Real theta = rd;
+    for (int i = 0; i < 10; ++i) {
+        Real t2 = theta * theta;
+        Real f = theta * (Real(1.0) + t2 * (k1 + t2 * (k2 + t2 * (k3 + t2 * k4)))) - rd;
+        Real fp = Real(1.0) + t2 * (Real(3.0) * k1 + t2 * (Real(5.0) * k2 + t2 * (Real(7.0) * k3 + t2 * Real(9.0) * k4)));
+        Real next = theta - f / fp;
+        if (next == theta) return theta;
+        theta = next;
+    }
+    return theta;
+}
+
 // BAL / Snavely model: log-focal, two radial distortion coefficients.
 // Projects along -z (BAL convention).
 struct SnavelyModel : ICameraModel {
+    bool directionFront(RVec3 p, RVec2 obs) { return -p.z >= Real(1e-8); }
+    static const int kDirectionForwardZ = -1;
     static const int kNumIntr = 3;
     static const bool kPeriodicX = false;
     Real f_log; Real k1; Real k2;
@@ -76,6 +93,8 @@ struct SnavelyModel : ICameraModel {
 // Same model with the focal length parameterized directly (as Ceres' BAL
 // examples do) instead of log-focal.
 struct SnavelyFModel : ICameraModel {
+    bool directionFront(RVec3 p, RVec2 obs) { return -p.z >= Real(1e-8); }
+    static const int kDirectionForwardZ = -1;
     static const int kNumIntr = 3;
     static const bool kPeriodicX = false;
     Real f; Real k1; Real k2;
@@ -96,6 +115,8 @@ struct SnavelyFModel : ICameraModel {
 // (+z looking, pixel = f * distorted + c). Demonstrates that models with a
 // different parameter count drop in without touching the solver.
 struct PinholeRadialModel : ICameraModel {
+    bool directionFront(RVec3 p, RVec2 obs) { return p.z >= Real(1e-8); }
+    static const int kDirectionForwardZ = 1;
     static const int kNumIntr = 5;
     static const bool kPeriodicX = false;
     Real f; Real cx; Real cy; Real k1; Real k2;
@@ -116,6 +137,8 @@ struct PinholeRadialModel : ICameraModel {
 
 // COLMAP SIMPLE_PINHOLE: one focal, principal point, no distortion.
 struct SimplePinholeModel : ICameraModel {
+    bool directionFront(RVec3 p, RVec2 obs) { return p.z >= Real(1e-8); }
+    static const int kDirectionForwardZ = 1;
     static const int kNumIntr = 3;
     static const bool kPeriodicX = false;
     Real f; Real cx; Real cy;
@@ -129,6 +152,8 @@ struct SimplePinholeModel : ICameraModel {
 
 // COLMAP PINHOLE: separate focals, principal point, no distortion.
 struct PinholeModel : ICameraModel {
+    bool directionFront(RVec3 p, RVec2 obs) { return p.z >= Real(1e-8); }
+    static const int kDirectionForwardZ = 1;
     static const int kNumIntr = 4;
     static const bool kPeriodicX = false;
     Real fx; Real fy; Real cx; Real cy;
@@ -144,6 +169,8 @@ struct PinholeModel : ICameraModel {
 // tangential coefficients (Brown-Conrady). Host mirror: sfm/core/Camera.h's
 // CamModel::OpenCV project(). +z looking, pixel = f*distorted + c.
 struct OpenCVModel : ICameraModel {
+    bool directionFront(RVec3 p, RVec2 obs) { return p.z >= Real(1e-8); }
+    static const int kDirectionForwardZ = 1;
     static const int kNumIntr = 8;
     static const bool kPeriodicX = false;
     Real fx; Real fy; Real cx; Real cy; Real k1; Real k2; Real p1; Real p2;
@@ -171,6 +198,14 @@ struct OpenCVModel : ICameraModel {
 // 90 deg (p.z <= 0), which is why the reconstruction had to move onto bearings
 // (D31). Host mirror: sfm/core/Camera.h CamModel::OpenCVFisheye.
 struct FisheyeModel : ICameraModel {
+    bool directionFront(RVec3 p, RVec2 obs) {
+        Real u = (obs.x - cx) / fx, v = (obs.y - cy) / fy;
+        Real rd = sqrt(u * u + v * v);
+        if (rd < Real(1e-12)) return p.z > Real(0.0);
+        Real theta = directionKBTheta(rd, k1, k2, k3, k4); RVec2 sc = rsincos(theta);
+        return dot3(p, rvec3(sc.x * u / rd, sc.x * v / rd, sc.y)) > Real(0.0);
+    }
+    static const int kDirectionForwardZ = 0;
     static const int kNumIntr = 8;
     static const bool kPeriodicX = false;
     Real fx; Real fy; Real cx; Real cy; Real k1; Real k2; Real k3; Real k4;
@@ -197,6 +232,8 @@ struct FisheyeModel : ICameraModel {
 // (1 + k1 r^2 + k2 r^4 + k3 r^6) / (1 + k4 r^2 + k5 r^4 + k6 r^6) -- plus the
 // two tangential terms. Host mirror: sfm/core/Camera.h CamModel::FullOpenCV.
 struct FullOpenCVModel : ICameraModel {
+    bool directionFront(RVec3 p, RVec2 obs) { return p.z >= Real(1e-8); }
+    static const int kDirectionForwardZ = 1;
     static const int kNumIntr = 12;
     static const bool kPeriodicX = false;
     Real fx; Real fy; Real cx; Real cy;
@@ -226,6 +263,24 @@ struct FullOpenCVModel : ICameraModel {
 // tangential and thin-prism terms, all in the equidistant coords (uf,vf) =
 // theta*(x,y)/r. Valid past 90 deg. Host mirror: CamModel::ThinPrismFisheye.
 struct ThinPrismFisheyeModel : ICameraModel {
+    bool directionFront(RVec3 p, RVec2 obs) {
+        Real u = (obs.x - cx) / fx, v = (obs.y - cy) / fy;
+        Real uf = Real(0.0), vf = Real(0.0), theta = Real(0.0), dtx = Real(0.0), dty = Real(0.0);
+        for (int i = 0; i < 6; ++i) {
+            Real a = u - dtx, b = v - dty, rd = sqrt(a * a + b * b);
+            if (rd < Real(1e-12)) { theta = uf = vf = Real(0.0); break; }
+            theta = directionKBTheta(rd, k1, k2, k3, k4); uf = theta * a / rd; vf = theta * b / rd;
+            Real r2 = theta * theta;
+            Real tx = Real(2.0) * p1 * uf * vf + p2 * (r2 + Real(2.0) * uf * uf) + sx1 * r2;
+            Real ty = p1 * (r2 + Real(2.0) * vf * vf) + Real(2.0) * p2 * uf * vf + sy1 * r2;
+            if (tx == dtx && ty == dty) break;
+            dtx = tx; dty = ty;
+        }
+        if (theta < Real(1e-12)) return p.z > Real(0.0);
+        RVec2 sc = rsincos(theta); Real s = sc.x / theta;
+        return dot3(p, rvec3(s * uf, s * vf, sc.y)) > Real(0.0);
+    }
+    static const int kDirectionForwardZ = 0;
     static const int kNumIntr = 12;
     static const bool kPeriodicX = false;
     Real fx; Real fy; Real cx; Real cy;
@@ -258,6 +313,13 @@ struct ThinPrismFisheyeModel : ICameraModel {
 // The two parameters are the image dimensions and are never refined (the host
 // gives this group a free count of 0). Host mirror: CamModel::Equirect.
 struct EquirectModel : ICameraModel {
+    bool directionFront(RVec3 p, RVec2 obs) {
+        Real theta = (obs.x / w - Real(0.5)) * Real(6.2831853071795864769);
+        Real phi = (Real(0.5) - obs.y / h) * Real(3.14159265358979323846);
+        RVec2 a = rsincos(theta), b = rsincos(phi);
+        return dot3(p, rvec3(b.y * a.x, -b.x, b.y * a.y)) > Real(0.0);
+    }
+    static const int kDirectionForwardZ = 0;
     static const int kNumIntr = 2;
     static const bool kPeriodicX = true;
     Real w; Real h;
@@ -304,4 +366,27 @@ RVec2 reprojectRig<M : ICameraModel>(
     Real pose[6], Real ext[6], Real intr[M.kNumIntr], RVec3 X, no_diff RVec2 obs
 ) {
     return projectResidual<M>(intr, applyPose(ext, applyPose(pose, X)), obs);
+}
+
+[Differentiable]
+RVec3 rotateDirection(Real pose[6], RVec3 direction) {
+    return angleAxisRotate(rvec3(pose[0], pose[1], pose[2]), direction);
+}
+
+[Differentiable]
+RVec2 reprojectDirection<M : ICameraModel>(
+    Real pose[6], Real intr[M.kNumIntr], RVec3 direction, no_diff RVec2 obs
+) {
+    return projectResidual<M>(intr, rotateDirection(pose, direction), obs);
+}
+
+[Differentiable]
+RVec2 reprojectRigDirection<M : ICameraModel>(
+    Real pose[6], Real ext[6], Real intr[M.kNumIntr], RVec3 direction, no_diff RVec2 obs
+) {
+    return projectResidual<M>(intr, rotateDirection(ext, rotateDirection(pose, direction)), obs);
+}
+
+bool directionForward<M : ICameraModel>(RVec3 direction, Real intr[M.kNumIntr], RVec2 observation) {
+    M camera = M.fromArray(intr); return camera.directionFront(direction, observation);
 }
